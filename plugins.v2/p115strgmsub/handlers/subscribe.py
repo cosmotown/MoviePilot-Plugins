@@ -22,11 +22,23 @@ class SubscribeHandler:
         self,
         exclude_subscribes: List[int] = None,
         notify: bool = False,
-        post_message_func: Callable = None
+        post_message_func: Callable = None,
+        is_excluded_func: Callable[[int], bool] = None
     ):
+        """
+        :param exclude_subscribes: 排除的订阅ID列表（is_excluded_func 未提供时使用）
+        :param is_excluded_func: 订阅过滤判断函数，支持排除/指定两种模式
+        """
         self._exclude_subscribes = exclude_subscribes or []
         self._notify = notify
         self._post_message = post_message_func
+        self._is_excluded_func = is_excluded_func
+
+    def _is_excluded(self, subscribe_id: int) -> bool:
+        """判断订阅是否不归本插件处理"""
+        if self._is_excluded_func:
+            return bool(self._is_excluded_func(subscribe_id))
+        return subscribe_id in set(self._exclude_subscribes or [])
 
     # ------------------ 订阅完成逻辑（完整保留） ------------------
 
@@ -184,7 +196,6 @@ class SubscribeHandler:
 
     def apply_subscribe_sites_by_site_names(self, site_names: List[str], action_desc: str = "") -> List[int]:
         action_desc = action_desc or f"设置订阅sites={site_names}"
-        exclude_ids = set(self._exclude_subscribes or [])
         site_names_norm = self._normalize_site_names(site_names)
 
         if not site_names_norm:
@@ -226,7 +237,7 @@ class SubscribeHandler:
 
             updated, excluded = 0, 0
             for s in subscribes:
-                if s.id in exclude_ids:
+                if self._is_excluded(s.id):
                     excluded += 1
                     continue
                 value = ",".join(str(x) for x in site_ids_uniq) if storage == "str" else site_ids_uniq
@@ -257,10 +268,9 @@ class SubscribeHandler:
                     pass
             storage = self._guess_sites_storage_format_from_rows(sample_sites)
 
-            exclude_ids = set(self._exclude_subscribes or [])
             updated, excluded = 0, 0
             for s in subscribes:
-                if s.id in exclude_ids:
+                if self._is_excluded(s.id):
                     excluded += 1
                     continue
                 value = str(site_id_115) if storage == "str" else [site_id_115]

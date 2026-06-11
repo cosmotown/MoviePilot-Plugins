@@ -375,13 +375,44 @@ class UIConfig:
                              'content': [{'component': 'VSwitch', 'props': {'model': 'skip_other_season_dirs', 'label': '多季剧集快速转存', 'hint': '跳过其他季目录以减少API调用，资源搜索不到的时候需要关闭此功能'}}]}
                         ]
                     },
-                    # 排除订阅
+                    # 订阅过滤模式
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12, 'md': 4},
+                            'content': [{
+                                'component': 'VSelect',
+                                'props': {
+                                    'model': 'subscribe_filter_mode',
+                                    'label': '订阅过滤模式',
+                                    'items': [
+                                        {'title': '排除模式（处理除勾选外的全部订阅）', 'value': 'exclude'},
+                                        {'title': '指定模式（仅处理勾选的订阅）', 'value': 'include'}
+                                    ],
+                                    'hint': '以PT订阅为主、网盘为辅时建议用指定模式，只勾选少数需要网盘补充的订阅',
+                                    'persistent-hint': True
+                                }
+                            }]
+                        }]
+                    },
+                    # 排除订阅（排除模式下生效）
                     {
                         'component': 'VRow',
                         'content': [{
                             'component': 'VCol',
                             'props': {'cols': 12},
-                            'content': [{'component': 'VSelect', 'props': {'model': 'exclude_subscribes', 'label': '排除订阅（选择不需要本插件处理的订阅）',
+                            'content': [{'component': 'VSelect', 'props': {'model': 'exclude_subscribes', 'label': '排除订阅（排除模式下生效：选择不需要本插件处理的订阅）',
+                                'multiple': True, 'chips': True, 'clearable': True, 'closable-chips': True, 'items': subscribe_options}}]
+                        }]
+                    },
+                    # 指定订阅（指定模式下生效）
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12},
+                            'content': [{'component': 'VSelect', 'props': {'model': 'include_subscribes', 'label': '指定订阅（指定模式下生效：仅勾选的订阅由本插件处理）',
                                 'multiple': True, 'chips': True, 'clearable': True, 'closable-chips': True, 'items': subscribe_options}}]
                         }]
                     }
@@ -432,7 +463,9 @@ class UIConfig:
             "hdhive_auto_refresh": True,
             "hdhive_refresh_before": 86400,
             "search_source_order": [],
+            "subscribe_filter_mode": "exclude",
             "exclude_subscribes": [],
+            "include_subscribes": [],
             "block_system_subscribe": False,
             "max_transfer_per_sync": 50,
             "batch_size": 20,

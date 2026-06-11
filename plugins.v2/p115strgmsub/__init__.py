@@ -70,7 +70,10 @@ class P115StrgmSub(_PluginBase):
     _save_path: str = "/我的接收/MoviePilot/TV"
     _movie_save_path: str = "/我的接收/MoviePilot/Movie"
     _only_115: bool = True
+    # 订阅过滤模式："exclude" 排除模式（处理除勾选外的全部订阅）/ "include" 指定模式（仅处理勾选的订阅）
+    _subscribe_filter_mode: str = "exclude"
     _exclude_subscribes: List[int] = []
+    _include_subscribes: List[int] = []
     # 搜索源优先级（按列表顺序），为空时默认 Nullbr > HDHive > PanSou
     _search_source_order: List[str] = []
 
@@ -257,9 +260,19 @@ class P115StrgmSub(_PluginBase):
             with SessionFactory() as new_db:
                 return _do_ensure(new_db)
 
+    def _is_subscribe_excluded(self, subscribe_id: int) -> bool:
+        """
+        按订阅过滤模式判断订阅是否不归本插件处理
+
+        - exclude 排除模式：勾选的订阅被排除，其余全部处理
+        - include 指定模式：仅处理勾选的订阅，其余全部排除
+        """
+        if self._subscribe_filter_mode == "include":
+            return subscribe_id not in set(self._include_subscribes or [])
+        return subscribe_id in set(self._exclude_subscribes or [])
+
     def _apply_sites_to_all_subscribes(self, site_ids: List[int], reason: str):
         """ 应用站点ID到所有订阅 """
-        exclude_ids = set(self._exclude_subscribes or [])
         with SessionFactory() as db:
             # 复用 SubscribeOper 实例，避免循环中重复创建
             subscribe_oper = SubscribeOper(db=db)
@@ -267,7 +280,7 @@ class P115StrgmSub(_PluginBase):
             updated = 0
             excluded = 0
             for s in subs:
-                if s.id in exclude_ids:
+                if self._is_subscribe_excluded(s.id):
                     excluded += 1
                     continue
                 subscribe_oper.update(s.id, {"sites": site_ids})
@@ -476,6 +489,9 @@ class P115StrgmSub(_PluginBase):
         sid = self._get_subscribe_id_from_event(event)
         if not sid:
             return
+        if self._is_subscribe_excluded(sid):
+            logger.info(f"新增订阅不在本插件处理范围（订阅过滤模式：{self._subscribe_filter_mode}），跳过站点同步（subscribe_id={sid}）")
+            return
         try:
             self._init_subscribe_handler()
 
@@ -542,7 +558,11 @@ class P115StrgmSub(_PluginBase):
             self._save_path = config.get("save_path", "/我的接收/MoviePilot/TV")
             self._movie_save_path = config.get("movie_save_path", "/我的接收/MoviePilot/Movie")
             self._only_115 = config.get("only_115", True)
+            self._subscribe_filter_mode = config.get("subscribe_filter_mode", "exclude") or "exclude"
             self._exclude_subscribes = config.get("exclude_subscribes", []) or []
+            self._include_subscribes = config.get("include_subscribes", []) or []
+            if self._subscribe_filter_mode == "include":
+                logger.info(f"订阅过滤模式：指定模式，仅处理 {len(self._include_subscribes)} 个勾选订阅")
 
             self._nullbr_enabled = config.get("nullbr_enabled", False)
             self._nullbr_appid = config.get("nullbr_appid", "")
@@ -738,7 +758,8 @@ class P115StrgmSub(_PluginBase):
         self._subscribe_handler = SubscribeHandler(
             exclude_subscribes=self._exclude_subscribes,
             notify=self._notify,
-            post_message_func=self.post_message
+            post_message_func=self.post_message,
+            is_excluded_func=self._is_subscribe_excluded
         )
 
     def _init_handlers(self):
@@ -831,7 +852,9 @@ class P115StrgmSub(_PluginBase):
             "hdhive_refresh_before": self._hdhive_refresh_before,
             # 其他配置
             "search_source_order": self._search_source_order,
+            "subscribe_filter_mode": self._subscribe_filter_mode,
             "exclude_subscribes": self._exclude_subscribes,
+            "include_subscribes": self._include_subscribes,
             "block_system_subscribe": self._block_system_subscribe,
             "max_transfer_per_sync": self._max_transfer_per_sync,
             "batch_size": self._batch_size,
@@ -1029,12 +1052,14 @@ class P115StrgmSub(_PluginBase):
         transferred_count = 0
 
         exclude_ids = set(self._exclude_subscribes or [])
+        skipped_count = 0
 
         # 处理电影
         for subscribe in movie_subscribes:
             if global_vars.is_system_stopped:
                 break
-            if subscribe.id in exclude_ids:
+            if self._is_subscribe_excluded(subscribe.id):
+                skipped_count += 1
                 continue
             transferred_count = self._sync_handler.process_movie_subscribe(
                 subscribe=subscribe,
@@ -1047,7 +1072,8 @@ class P115StrgmSub(_PluginBase):
         for subscribe in tv_subscribes:
             if global_vars.is_system_stopped:
                 break
-            if subscribe.id in exclude_ids:
+            if self._is_subscribe_excluded(subscribe.id):
+                skipped_count += 1
                 continue
             transferred_count = self._sync_handler.process_tv_subscribe(
                 subscribe=subscribe,
@@ -1056,6 +1082,10 @@ class P115StrgmSub(_PluginBase):
                 transferred_count=transferred_count,
                 exclude_ids=exclude_ids
             )
+
+        if skipped_count:
+            mode_label = "指定模式" if self._subscribe_filter_mode == "include" else "排除模式"
+            logger.info(f"订阅过滤（{mode_label}）：本次跳过 {skipped_count} 个不在处理范围的订阅")
 
         self.save_data('history', history)
 
