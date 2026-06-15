@@ -4,11 +4,12 @@
     "release": true,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.5.2",
+    "version": "1.5.3",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.5.3": "1. 更新115依赖",
       "v1.5.2": "1. 新增订阅过滤模式：排除模式（默认）与指定模式（仅处理勾选的订阅），适合以PT订阅为主、网盘订阅为辅的用户；",
       "v1.5.1": "1. 更新版本号；",
       "v1.5.0": "1. 适配影巢（HDHive）新版 OpenAPI：应用 Secret + OAuth 用户授权，旧个人 API Key 不再可用；2. 支持 Access Token 自动刷新与持久化；3. 配置页新增 Client ID、应用 Secret、回调地址、授权码字段（接入步骤见配置页说明）；4. 移除 HDHive 签到功能；5. 支持自定义搜索源优先级排序；",
