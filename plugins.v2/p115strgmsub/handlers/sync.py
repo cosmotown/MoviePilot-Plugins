@@ -50,6 +50,7 @@ class SyncHandler:
         :param chain: MediaChain 实例
         :param save_path: 电视剧转存目录
         :param movie_save_path: 电影转存目录
+        :param classifier_client: OpenClaw 七分类客户端
         :param max_transfer_per_sync: 单次同步最大转存数量
         :param batch_size: 批量转存每批文件数
         :param skip_other_season_dirs: 跳过其他季目录
@@ -780,7 +781,7 @@ class SyncHandler:
                                 if not matched_items:
                                     continue
 
-                       # 检查转存配额限制
+                        # 检查转存配额限制
                         remaining_quota = self._max_transfer_per_sync - transferred_count
                         if len(matched_items) > remaining_quota:
                             logger.info(f"匹配 {len(matched_items)} 集，但受配额限制仅转存 {remaining_quota} 集")
