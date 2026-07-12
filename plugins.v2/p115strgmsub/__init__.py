@@ -723,7 +723,26 @@ class P115StrgmSub(_PluginBase):
 
         if self._cookies:
             self._p115_manager = P115ClientManager(cookies=self._cookies)
+            
+        # OpenClaw 七分类客户端
+        self._classifier_client = OpenClawClassifierClient(
+            base_url=self._classifier_url,
+            token=self._classifier_token,
+            enabled=self._classifier_enabled,
+            timeout=self._classifier_timeout,
+        )
 
+        if self._classifier_enabled:
+            if self._classifier_client.is_ready:
+                logger.info(
+                    f"OpenClaw 七分类服务已启用："
+                    f"{self._classifier_url}"
+                )
+            else:
+                logger.warning(
+                    "OpenClaw 七分类服务已启用，但地址或 Token 未配置完整"
+                )
+                
     # ------------------ HDHive OpenAPI ------------------
 
     def _on_hdhive_token_update(self, tokens: Dict[str, Any]):
