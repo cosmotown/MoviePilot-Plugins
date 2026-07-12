@@ -712,6 +712,32 @@ class SyncHandler:
                             logger.info(f"该分享未匹配到 S{season} 的任何缺失剧集，可能是季数不匹配或文件名无法识别")
                             continue
 
+                        # 调用 OpenClaw 七分类服务确定剧集目标根目录
+                        target_root = self._resolve_target_root(
+                            share_url=share_url,
+                            media_type="tv",
+                            title=mediainfo.title,
+                            fallback_root=self._save_path,
+                            year=mediainfo.year,
+                            tmdb_id=mediainfo.tmdb_id,
+                            season=season,
+                            resource_title=resource_title,
+                            file_names=[
+                                item["file"].get("name", "")
+                                for item in matched_items
+                            ],
+                        )
+                        if not target_root:
+                            continue
+
+                        # 分类根目录下保留标题、年份和季度目录
+                        save_dir = (
+                            f"{target_root.rstrip('/')}/"
+                            f"{show_folder}/Season {season}"
+                        )
+                        logger.info(f"剧集分类后的转存目标路径: {save_dir}")
+
+
                         # 检查转存配额限制
                         remaining_quota = self._max_transfer_per_sync - transferred_count
                         if len(matched_items) > remaining_quota:
