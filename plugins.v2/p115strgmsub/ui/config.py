@@ -493,6 +493,12 @@ class UIConfig:
             "save_path": "/我的接收/MoviePilot/TV",
             "movie_save_path": "/我的接收/MoviePilot/Movie",
             "cookies": "",
+            
+            # OpenClaw 七分类服务
+            "classifier_enabled": False,
+            "classifier_url": "http://192.168.5.102:11591",
+            "classifier_token": "",
+            "classifier_timeout": 120,
             "pansou_enabled": True,
             "pansou_url": "https://so.252035.xyz/",
             "pansou_username": "",
