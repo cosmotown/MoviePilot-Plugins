@@ -913,6 +913,11 @@ class P115StrgmSub(_PluginBase):
             "max_transfer_per_sync": self._max_transfer_per_sync,
             "batch_size": self._batch_size,
             "skip_other_season_dirs": self._skip_other_season_dirs,
+            # OpenClaw 七分类服务配置
+            "classifier_enabled": self._classifier_enabled,
+            "classifier_url": self._classifier_url,
+            "classifier_token": self._classifier_token,
+            "classifier_timeout": self._classifier_timeout,
             "unblock_site_ids": self._unblock_site_ids,
             "unblock_site_names": self._unblock_site_names,
             "unblock_delay_minutes": self._unblock_delay_minutes,
