@@ -740,8 +740,41 @@ class SyncHandler:
                         )
                         logger.info(f"剧集分类后的转存目标路径: {save_dir}")
 
+                        # 检查分类后的真实目录中是否已有剧集
+                        classified_existing = FileMatcher.check_existing_episodes(
+                            self._p115_manager,
+                            mediainfo,
+                            season,
+                            save_dir,
+                        )
 
-                        # 检查转存配额限制
+                        if classified_existing:
+                            existing_episodes_in_cloud |= classified_existing
+
+                            # 洗版模式下，需要升级的剧集不能因文件已存在而跳过
+                            skip_existing = set(classified_existing)
+                            if is_best_version and episode_history_scores:
+                                skip_existing -= set(episode_history_scores.keys())
+
+                            if skip_existing:
+                                matched_items = [
+                                    item
+                                    for item in matched_items
+                                    if item["episode"] not in skip_existing
+                                ]
+                                missing_episodes = [
+                                    episode
+                                    for episode in missing_episodes
+                                    if episode not in skip_existing
+                                ]
+                                logger.info(
+                                    f"分类目录中已存在 {len(skip_existing)} 集，已跳过"
+                                )
+
+                                if not matched_items:
+                                    continue
+
+                       # 检查转存配额限制
                         remaining_quota = self._max_transfer_per_sync - transferred_count
                         if len(matched_items) > remaining_quota:
                             logger.info(f"匹配 {len(matched_items)} 集，但受配额限制仅转存 {remaining_quota} 集")
