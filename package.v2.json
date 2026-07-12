@@ -1,14 +1,15 @@
 {
   "P115StrgmSub": {
     "name": "115网盘订阅追更",
-    "release": true,
+    "release": false,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.5.6",
+    "version": "1.6.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.6.0": "新增 AYCLUB Telegram 搜索源：通过本机桥接服务查询 @ayclub_bot，支持基于 TMDB ID、标题、年份和季数精确匹配115资源，并支持自定义搜索优先级、超时和翻页数量。",
       "v1.5.6": "修复115订阅创建时原生PT抢跑问题：屏蔽状态将系统订阅站点锁定为115虚拟站点，恢复窗口自动还原PT站点；115虚拟站点保持禁用，避免站点检测助手反复报错。",
       "v1.5.5": "修复 PanSou 服务偶发返回错误重定向导致搜索失败的问题，遇到异常 3xx 时自动重试原地址。",
       "v1.5.4": "1. 接入 OpenClaw 七分类服务，支持电影、电视剧、动漫、特摄剧和特摄剧场版自动分流；2. 分类失败或需要人工确认时禁止盲目转存；3. 修复分类目录中的剧集重复检查。",
