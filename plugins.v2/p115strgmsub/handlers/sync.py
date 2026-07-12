@@ -507,10 +507,13 @@ class SyncHandler:
             show_folder = f"{mediainfo.title} ({mediainfo.year})" if mediainfo.year else mediainfo.title
             save_dir = f"{self._save_path}/{show_folder}/Season {season}"
 
-            # 检查网盘目录中已存在的剧集
-            existing_episodes_in_cloud = FileMatcher.check_existing_episodes(
-                self._p115_manager, mediainfo, season, save_dir
-            )
+            # 启用七分类时，实际目录要等分享分类后才能确定
+            if self._classifier_client and self._classifier_client.is_ready:
+                existing_episodes_in_cloud = set()
+            else:
+                existing_episodes_in_cloud = FileMatcher.check_existing_episodes(
+                    self._p115_manager, mediainfo, season, save_dir
+                )
 
             # 合并已存在的集数
             all_existing = transferred_episodes | existing_episodes_in_cloud
