@@ -846,6 +846,7 @@ class P115StrgmSub(_PluginBase):
             chain=self.chain,
             save_path=self._save_path,
             movie_save_path=self._movie_save_path,
+            classifier_client=self._classifier_client,
             max_transfer_per_sync=self._max_transfer_per_sync,
             batch_size=self._batch_size,
             skip_other_season_dirs=self._skip_other_season_dirs,
