@@ -225,10 +225,41 @@ class PanSouClient:
             if cloud_types:
                 payload["cloud_types"] = cloud_types
 
-            logger.info(f"PanSou 搜索: {payload}")
-            self._api_call_count += 1
-            response = requests.post(search_url, json=payload, headers=headers, timeout=120, proxies=self._proxies)
-          
+                        logger.info(f"PanSou 搜索: {payload}")
+
+            def _post_search(timeout: int):
+                response = None
+
+                for attempt in range(1, 4):
+                    self._api_call_count += 1
+                    response = requests.post(
+                        search_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
+                        proxies=self._proxies,
+                        allow_redirects=False,
+                    )
+
+                    if response.status_code not in (
+                        301,
+                        302,
+                        303,
+                        307,
+                        308,
+                    ):
+                        return response
+
+                    logger.warning(
+                        f"PanSou 返回异常重定向："
+                        f"HTTP {response.status_code}，"
+                        f"Location={response.headers.get('Location')}，"
+                        f"正在重试原地址（{attempt}/3）"
+                    )
+
+                return response
+
+            response = _post_search(timeout=120)
 
             # Token 失效重试
             if response.status_code == 401 and self.auth_enabled:
@@ -238,8 +269,7 @@ class PanSouClient:
                 token = self._get_token()
                 if token:
                     headers["Authorization"] = f"Bearer {token}"
-                    self._api_call_count += 1
-                    response = requests.post(search_url, json=payload, headers=headers, timeout=30, proxies=self._proxies)
+                    response = _post_search(timeout=30)
 
             if response.status_code != 200:
                 return {
