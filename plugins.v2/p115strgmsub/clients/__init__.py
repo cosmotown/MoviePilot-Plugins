@@ -6,11 +6,13 @@ from .p115 import P115ClientManager
 from .pansou import PanSouClient
 from .nullbr import NullbrClient
 from .hdhive import HDHiveOpenAPIClient, HDHiveOpenAPIError
+from .openclaw_classifier import OpenClawClassifierClient
 
 __all__ = [
     "P115ClientManager",
     "PanSouClient",
     "NullbrClient",
     "HDHiveOpenAPIClient",
-    "HDHiveOpenAPIError"
+    "HDHiveOpenAPIError",
+    "OpenClawClassifierClient",
 ]
