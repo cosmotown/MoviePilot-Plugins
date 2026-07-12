@@ -93,9 +93,15 @@ class SyncHandler:
         """
         if (
             not self._classifier_client
-            or not self._classifier_client.is_ready
+            or not self._classifier_client.enabled
         ):
             return fallback_root
+
+        if not self._classifier_client.is_ready:
+            logger.warning(
+                "OpenClaw 分类服务已启用但配置不完整，跳过转存"
+            )
+            return None
 
         result = self._classifier_client.inspect_share(
             share_url=share_url,
