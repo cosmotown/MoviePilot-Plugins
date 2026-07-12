@@ -269,6 +269,7 @@ class UIConfig:
                                     'model': 'search_source_order',
                                     'label': '搜索源优先级（按选择顺序排序）',
                                     'items': [
+                                        {'title': 'AYCLUB Telegram', 'value': 'ayclub'},
                                         {'title': 'PanSou (盘搜)', 'value': 'pansou'},
                                         {'title': 'HDHive (影巢)', 'value': 'hdhive'},
                                         {'title': 'Nullbr', 'value': 'nullbr'}
@@ -277,12 +278,84 @@ class UIConfig:
                                     'chips': True,
                                     'clearable': True,
                                     'closable-chips': True,
-                                    'hint': '按选择的先后顺序依次搜索，前面的源搜到结果就不再查询后面的；留空使用默认优先级 Nullbr > HDHive > PanSou；未选入的已启用源会自动排在末尾',
+                                    'hint': '按选择的先后顺序依次搜索，前面的源搜到结果就不再查询后面的；留空使用默认优先级 Nullbr > HDHive > PanSou > AYCLUB；未选入的已启用源会自动排在末尾',
                                     'persistent-hint': True
                                 }
                             }]
                         }]
+                    },                    
+                    # AYCLUB Telegram 桥接配置
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12},
+                            'content': [{
+                                'component': 'VAlert',
+                                'props': {
+                                    'type': 'info',
+                                    'variant': 'tonal',
+                                    'text': 'AYCLUB：通过本机 Telegram 桥接服务查询 @ayclub_bot，并使用 TMDB ID、标题和年份精确匹配115资源。'
+                                }
+                            }]
+                        }]
                     },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'ayclub_enabled',
+                                        'label': '启用 AYCLUB'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 5},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'ayclub_url',
+                                        'label': 'AYCLUB 桥接地址',
+                                        'placeholder': 'http://127.0.0.1:11592'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'ayclub_timeout',
+                                        'label': '查询超时（秒）',
+                                        'type': 'number',
+                                        'placeholder': '120'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'md': 3},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'ayclub_max_pages',
+                                        'label': '最多扫描页数',
+                                        'type': 'number',
+                                        'placeholder': '5',
+                                        'hint': '范围1至10，页数越多查询越慢',
+                                        'persistent-hint': True
+                                    }
+                                }]
+                            }
+                        ]
+                    },                    
                     # PanSou说明
                     {
                         'component': 'VRow',
@@ -505,6 +578,13 @@ class UIConfig:
             "pansou_password": "",
             "pansou_auth_enabled": False,
             "pansou_channels": "QukanMovie",
+
+            # AYCLUB Telegram
+            "ayclub_enabled": False,
+            "ayclub_url": "http://127.0.0.1:11592",
+            "ayclub_timeout": 120,
+            "ayclub_max_pages": 5,
+
             "nullbr_enabled": False,
             "nullbr_appid": "",
             "nullbr_api_key": "",
