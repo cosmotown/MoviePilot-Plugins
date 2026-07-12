@@ -266,8 +266,27 @@ class SyncHandler:
                             else:
                                 logger.info(f"电影 {mediainfo.title} 洗版：旧分数 {movie_history_score} -> 新分数 {current_score}")
 
-                        # 构建转存路径
-                        save_dir = f"{self._movie_save_path}/{mediainfo.title} ({mediainfo.year})" if mediainfo.year else f"{self._movie_save_path}/{mediainfo.title}"
+                        # 调用 OpenClaw 七分类服务确定目标根目录
+                        target_root = self._resolve_target_root(
+                            share_url=share_url,
+                            media_type="movie",
+                            title=mediainfo.title,
+                            fallback_root=self._movie_save_path,
+                            year=mediainfo.year,
+                            tmdb_id=mediainfo.tmdb_id,
+                            resource_title=resource_title,
+                            file_names=[file_name],
+                        )
+                        if not target_root:
+                            continue
+
+                        # 分类根目录下继续保留 MoviePilot 标准标题 + 年份目录
+                        movie_folder = (
+                            f"{mediainfo.title} ({mediainfo.year})"
+                            if mediainfo.year
+                            else mediainfo.title
+                        )
+                        save_dir = f"{target_root.rstrip('/')}/{movie_folder}"
                         logger.info(f"转存目标路径: {save_dir}")
 
                         # 执行转存
