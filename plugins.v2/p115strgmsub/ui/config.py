@@ -200,6 +200,63 @@ class UIConfig:
                              'content': [{'component': 'VTextField', 'props': {'model': 'cookies', 'label': '115 Cookie', 'type': 'password', 'placeholder': 'UID=xxx; CID=xxx; SEID=xxx'}}]}
                         ]
                     },
+                    # OpenClaw 七分类服务配置
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'classifier_enabled',
+                                        'label': '启用七分类'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'classifier_url',
+                                        'label': 'OpenClaw 分类服务地址',
+                                        'placeholder': 'http://192.168.5.102:11591'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'classifier_token',
+                                        'label': 'OpenClaw 分类服务 Token',
+                                        'type': 'password',
+                                        'placeholder': '请填写桥接服务 Token',
+                                        'clearable': True
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'classifier_timeout',
+                                        'label': '分类超时（秒）',
+                                        'type': 'number',
+                                        'placeholder': '120'
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+
                     # 搜索源优先级
                     {
                         'component': 'VRow',
