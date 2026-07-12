@@ -32,7 +32,9 @@ class SearchHandler:
         hdhive_max_points_per_sub: int = 20,
         only_115: bool = True,
         pansou_channels: str = "",
-        search_source_order: Optional[List[str]] = None
+        search_source_order: Optional[List[str]] = None,
+        ayclub_client=None,
+        ayclub_enabled: bool = False
     ):
         """
         初始化搜索处理器
@@ -74,6 +76,8 @@ class SearchHandler:
         self._only_115 = only_115
         self._pansou_channels = pansou_channels
         self._search_source_order = search_source_order or []
+        self._ayclub_client = ayclub_client
+        self._ayclub_enabled = ayclub_enabled
 
     def get_enabled_sources(self) -> List[str]:
         """
@@ -103,6 +107,14 @@ class SearchHandler:
         # PanSou
         if self._pansou_enabled and self._pansou_client:
             available.append("pansou")
+            
+        # AYCLUB Telegram
+        if (
+            self._ayclub_enabled
+            and self._ayclub_client
+            and self._ayclub_client.is_ready
+        ):
+            available.append("ayclub")
 
         # 应用用户自定义优先级
         if self._search_source_order:
@@ -169,6 +181,15 @@ class SearchHandler:
                 return self._search_pansou_movie(mediainfo)
             else:
                 return self._search_pansou_tv(mediainfo, season)
+        elif source == "ayclub":
+            if not self._ayclub_client:
+                return []
+
+            return self._ayclub_client.search(
+                mediainfo=mediainfo,
+                media_type=media_type,
+                season=season,
+            )
         else:
             logger.warning(f"未知的搜索源: {source}")
             return []
