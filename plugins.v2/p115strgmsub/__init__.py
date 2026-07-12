@@ -602,7 +602,27 @@ class P115StrgmSub(_PluginBase):
             self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
             self._batch_size = int(config.get("batch_size", 20) or 20)
             self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
-
+            
+            # OpenClaw 七分类服务配置
+            self._classifier_enabled = bool(
+                config.get("classifier_enabled", False)
+            )
+            self._classifier_url = (
+                config.get(
+                    "classifier_url",
+                    "http://192.168.5.102:11591",
+                )
+                or ""
+            ).strip()
+            self._classifier_token = (
+                config.get("classifier_token", "")
+                or ""
+            ).strip()
+            self._classifier_timeout = int(
+                config.get("classifier_timeout", 120)
+                or 120
+            )
+            
             # 搜索源优先级（兼容逗号分隔字符串）
             raw_order = config.get("search_source_order", []) or []
             if isinstance(raw_order, str):
