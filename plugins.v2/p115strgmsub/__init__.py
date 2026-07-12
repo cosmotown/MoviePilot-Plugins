@@ -28,6 +28,7 @@ from .clients import (
     HDHiveOpenAPIClient,
     HDHiveOpenAPIError,
     OpenClawClassifierClient,
+    AyclubClient,
 )
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
 from .ui import UIConfig
@@ -73,6 +74,11 @@ class P115StrgmSub(_PluginBase):
     _pansou_password: str = ""
     _pansou_auth_enabled: bool = False
     _pansou_channels: str = "QukanMovie"
+    # AYCLUB Telegram 桥接服务
+    _ayclub_enabled: bool = False
+    _ayclub_url: str = "http://127.0.0.1:11592"
+    _ayclub_timeout: int = 120
+    _ayclub_max_pages: int = 5
 
     _save_path: str = "/我的接收/MoviePilot/TV"
     _movie_save_path: str = "/我的接收/MoviePilot/Movie"
@@ -132,8 +138,9 @@ class P115StrgmSub(_PluginBase):
     _p115_manager: Optional[P115ClientManager] = None
     _nullbr_client: Optional[NullbrClient] = None
     _hdhive_client: Optional[Any] = None
+    _ayclub_client: Optional[AyclubClient] = None
     _classifier_client: Optional[OpenClawClassifierClient] = None
-
+    
     # 处理器
     _search_handler: Optional[SearchHandler] = None
     _subscribe_handler: Optional[SubscribeHandler] = None
@@ -632,6 +639,28 @@ class P115StrgmSub(_PluginBase):
             self._pansou_password = config.get("pansou_password", "")
             self._pansou_auth_enabled = config.get("pansou_auth_enabled", False)
             self._pansou_channels = config.get("pansou_channels", "QukanMovie")
+            # AYCLUB Telegram 桥接配置
+            self._ayclub_enabled = bool(
+                config.get("ayclub_enabled", False)
+            )
+            self._ayclub_url = (
+                config.get(
+                    "ayclub_url",
+                    "http://127.0.0.1:11592",
+                )
+                or ""
+            ).strip()
+            self._ayclub_timeout = int(
+                config.get("ayclub_timeout", 120)
+                or 120
+            )
+            self._ayclub_max_pages = min(
+                max(
+                    int(config.get("ayclub_max_pages", 5) or 5),
+                    1,
+                ),
+                10,
+            )
 
             self._save_path = config.get("save_path", "/我的接收/MoviePilot/TV")
             self._movie_save_path = config.get("movie_save_path", "/我的接收/MoviePilot/Movie")
@@ -787,6 +816,25 @@ class P115StrgmSub(_PluginBase):
 
         if self._cookies:
             self._p115_manager = P115ClientManager(cookies=self._cookies)
+        # AYCLUB Telegram 桥接客户端
+        self._ayclub_client = AyclubClient(
+            base_url=self._ayclub_url,
+            enabled=self._ayclub_enabled,
+            timeout=self._ayclub_timeout,
+            max_pages=self._ayclub_max_pages,
+        )
+
+        if self._ayclub_enabled:
+            if self._ayclub_client.health():
+                logger.info(
+                    f"AYCLUB Telegram 桥接服务连接成功："
+                    f"{self._ayclub_url}"
+                )
+            else:
+                logger.warning(
+                    f"AYCLUB Telegram 桥接服务不可用："
+                    f"{self._ayclub_url}"
+                )
             
         # OpenClaw 七分类客户端
         self._classifier_client = OpenClawClassifierClient(
@@ -898,7 +946,9 @@ class P115StrgmSub(_PluginBase):
             hdhive_cookie=self._hdhive_cookie,
             only_115=self._only_115,
             pansou_channels=self._pansou_channels,
-            search_source_order=self._search_source_order
+            search_source_order=self._search_source_order,
+            ayclub_client=self._ayclub_client,
+            ayclub_enabled=self._ayclub_enabled
         )
         # 设置持久化函数，用于保存订阅的历史积分花费
         self._search_handler.set_data_funcs(self.get_data, self.save_data)
@@ -947,6 +997,11 @@ class P115StrgmSub(_PluginBase):
             "pansou_password": self._pansou_password,
             "pansou_auth_enabled": self._pansou_auth_enabled,
             "pansou_channels": self._pansou_channels,
+            # AYCLUB Telegram
+            "ayclub_enabled": self._ayclub_enabled,
+            "ayclub_url": self._ayclub_url,
+            "ayclub_timeout": self._ayclub_timeout,
+            "ayclub_max_pages": self._ayclub_max_pages,
             "nullbr_enabled": self._nullbr_enabled,
             "nullbr_appid": self._nullbr_appid,
             "nullbr_api_key": self._nullbr_api_key,
