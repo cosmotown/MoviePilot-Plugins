@@ -17,8 +17,6 @@ class OpenClawClassifierClient:
     MOVIE_CATEGORIES = {
         "电影",
         "特摄剧场版",
-        "原盘电影",
-        "原盘动画电影",
     }
 
     TV_CATEGORIES = {
