@@ -225,7 +225,7 @@ class PanSouClient:
             if cloud_types:
                 payload["cloud_types"] = cloud_types
 
-                        logger.info(f"PanSou 搜索: {payload}")
+            logger.info(f"PanSou 搜索: {payload}")
 
             def _post_search(timeout: int):
                 response = None
