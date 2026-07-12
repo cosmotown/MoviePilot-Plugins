@@ -32,6 +32,7 @@ class SyncHandler:
         chain,
         save_path: str,
         movie_save_path: str,
+        classifier_client=None,
         max_transfer_per_sync: int = 50,
         batch_size: int = 20,
         skip_other_season_dirs: bool = True,
@@ -63,6 +64,7 @@ class SyncHandler:
         self._chain = chain
         self._save_path = save_path
         self._movie_save_path = movie_save_path
+        self._classifier_client = classifier_client
         self._max_transfer_per_sync = max_transfer_per_sync
         self._batch_size = batch_size
         self._skip_other_season_dirs = skip_other_season_dirs
@@ -70,6 +72,50 @@ class SyncHandler:
         self._post_message = post_message_func
         self._get_data = get_data_func
         self._save_data = save_data_func
+
+    def _resolve_target_root(
+        self,
+        share_url: str,
+        media_type: str,
+        title: str,
+        fallback_root: str,
+        year: Optional[int] = None,
+        tmdb_id: Optional[int] = None,
+        season: Optional[int] = None,
+        resource_title: str = "",
+        file_names: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """
+        获取七分类目标根目录。
+
+        分类服务未启用时沿用旧目录；
+        分类服务已启用但分类失败时返回 None，禁止盲目转存。
+        """
+        if (
+            not self._classifier_client
+            or not self._classifier_client.is_ready
+        ):
+            return fallback_root
+
+        result = self._classifier_client.inspect_share(
+            share_url=share_url,
+            media_type=media_type,
+            title=title,
+            year=year,
+            tmdb_id=tmdb_id,
+            season=season,
+            resource_title=resource_title,
+            file_names=file_names,
+        )
+
+        if not result:
+            logger.warning(
+                f"分类失败或需要人工确认，跳过转存："
+                f"{title} - {resource_title}"
+            )
+            return None
+
+        return result["target_dir"]
 
     def process_movie_subscribe(
         self,
