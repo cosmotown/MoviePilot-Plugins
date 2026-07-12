@@ -241,9 +241,20 @@ class P115StrgmSub(_PluginBase):
         :param db: 可选的数据库会话，若未传入则创建新会话
         """
         def _do_ensure(session):
-            row = session.execute(text("SELECT id FROM site WHERE name=:n LIMIT 1"), {"n": "115网盘"}).fetchone()
+            row = session.execute(
+                text("SELECT id, is_active FROM site WHERE name=:n LIMIT 1"),
+                {"n": "115网盘"}
+            ).fetchone()
             if row and row[0] is not None:
-                return int(row[0])
+                site_id = int(row[0])
+                if bool(row[1]):
+                    session.execute(
+                        text("UPDATE site SET is_active=FALSE WHERE id=:i"),
+                        {"i": site_id}
+                    )
+                    session.commit()
+                    logger.info(f"已禁用115虚拟站点：id={site_id}")
+                return site_id
 
             # existing = Site.get(session, -1)
             row_ex = session.execute(text("SELECT id FROM site WHERE id=:i"), {"i": -1}).fetchone()
@@ -257,7 +268,7 @@ class P115StrgmSub(_PluginBase):
                         "id": -1,
                         "name": "115网盘",
                         "url": "https://115.com",
-                        "is_active": True,
+                        "is_active": False,
                         "limit_interval": 10000000,
                         "limit_count": 1,
                         "limit_seconds": 10000000,
