@@ -21,7 +21,14 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, MediaType, NotificationType
 
-from .clients import PanSouClient, P115ClientManager, NullbrClient, HDHiveOpenAPIClient, HDHiveOpenAPIError
+from .clients import (
+    PanSouClient,
+    P115ClientManager,
+    NullbrClient,
+    HDHiveOpenAPIClient,
+    HDHiveOpenAPIError,
+    OpenClawClassifierClient,
+)
 from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
 from .ui import UIConfig
 from .utils import download_so_file
@@ -107,6 +114,12 @@ class P115StrgmSub(_PluginBase):
     _max_transfer_per_sync: int = 50
     _batch_size: int = 20
     _skip_other_season_dirs: bool = True
+    
+    # OpenClaw 七分类服务
+    _classifier_enabled: bool = False
+    _classifier_url: str = "http://192.168.5.102:11591"
+    _classifier_token: str = ""
+    _classifier_timeout: int = 120
 
     # 窗口配置：站点/延迟/窗口期
     _unblock_site_ids: List[int] = []
@@ -119,6 +132,7 @@ class P115StrgmSub(_PluginBase):
     _p115_manager: Optional[P115ClientManager] = None
     _nullbr_client: Optional[NullbrClient] = None
     _hdhive_client: Optional[Any] = None
+    _classifier_client: Optional[OpenClawClassifierClient] = None
 
     # 处理器
     _search_handler: Optional[SearchHandler] = None
