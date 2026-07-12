@@ -428,6 +428,13 @@ class P115StrgmSub(_PluginBase):
         self._cancel_toggle_jobs()
         self._init_subscribe_handler()
 
+        if not self._set_system_rss_sites(
+            [-1],
+            reason=f"进入屏蔽状态：{reason}"
+        ):
+            logger.error("进入屏蔽状态失败：无法设置 RssSites=[-1]")
+            return
+
         self._subscribe_handler.set_blocked_sites_only_115()
         self._block_system_subscribe = True
         self.__update_config()
@@ -457,8 +464,18 @@ class P115StrgmSub(_PluginBase):
             self._enter_blocked(reason=f"{reason}（站点解析失败）")
             return
 
-        self._apply_sites_to_all_subscribes(site_ids, reason="已恢复系统订阅：全量同步站点")
-        self._try_set_default_sites_for_unblocked(site_ids)
+        if not self._set_system_rss_sites(
+            site_ids,
+            reason=f"进入恢复窗口：{reason}"
+        ):
+            logger.error("恢复系统订阅失败：无法设置 PT 默认订阅站点")
+            self._enter_blocked(reason=f"{reason}（恢复RssSites失败）")
+            return
+
+        self._apply_sites_to_all_subscribes(
+            site_ids,
+            reason="已恢复系统订阅：全量同步站点"
+        )
 
         self._block_system_subscribe = False
         self.__update_config()
