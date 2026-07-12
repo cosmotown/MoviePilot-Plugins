@@ -327,6 +327,43 @@ class P115StrgmSub(_PluginBase):
     def _window_enabled(self) -> bool:
         return not self._window_disabled()
 
+    def _sync_115_virtual_rss_site(self, enabled: bool):
+        """
+        在系统默认订阅站点 RssSites 中添加或移除 115 虚拟站点。
+        只维护 id=-1，不改动用户原有 PT 站点。
+        """
+        try:
+            from app.db.systemconfig_oper import SystemConfigOper
+            from app.schemas.types import SystemConfigKey
+
+            oper = SystemConfigOper()
+            current = oper.get(SystemConfigKey.RssSites) or []
+
+            if not isinstance(current, list):
+                current = []
+
+            has_virtual = any(str(site_id) == "-1" for site_id in current)
+
+            if enabled and not has_virtual:
+                updated = list(current)
+                updated.append(-1)
+            elif not enabled and has_virtual:
+                updated = [
+                    site_id for site_id in current
+                    if str(site_id) != "-1"
+                ]
+            else:
+                return
+
+            oper.set(SystemConfigKey.RssSites, updated)
+            logger.info(
+                f"已同步系统订阅站点："
+                f"115虚拟站点={'已加入' if enabled else '已移除'}，"
+                f"站点总数={len(updated)}"
+            )
+        except Exception as e:
+            logger.error(f"同步115虚拟订阅站点失败：{e}")
+
     # ------------------ 系统默认订阅站点：只在已恢复系统订阅时尝试 ------------------
 
     def _try_set_default_sites_for_unblocked(self, site_ids: List[int]):
