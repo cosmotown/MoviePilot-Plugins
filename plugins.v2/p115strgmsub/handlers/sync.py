@@ -514,7 +514,7 @@ class SyncHandler:
             save_dir = f"{self._save_path}/{show_folder}/Season {season}"
 
             # 启用七分类时，实际目录要等分享分类后才能确定
-            if self._classifier_client and self._classifier_client.is_ready:
+            if self._classifier_client and self._classifier_client.enabled:
                 existing_episodes_in_cloud = set()
             else:
                 existing_episodes_in_cloud = FileMatcher.check_existing_episodes(
