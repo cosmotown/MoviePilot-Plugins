@@ -3,6 +3,7 @@
 结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集
 """
 import datetime
+import math
 from pathlib import Path
 from threading import Lock
 from typing import Optional, Any, List, Dict, Tuple
@@ -205,7 +206,7 @@ class P115StrgmSub(_PluginBase):
         """安全读取整数配置，格式错误时回退默认值。"""
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 f"配置 {field_name}={value!r} 不是有效整数，"
                 f"已回退默认值 {default}"
@@ -218,16 +219,20 @@ class P115StrgmSub(_PluginBase):
         default: float,
         field_name: str,
     ) -> float:
-        """安全读取浮点数配置，格式错误时回退默认值。"""
+        """安全读取有限浮点数，格式错误时回退默认值。"""
         try:
-            return float(value)
-        except (TypeError, ValueError):
+            parsed = float(value)
+
+            if not math.isfinite(parsed):
+                raise ValueError("non-finite number")
+
+            return parsed
+        except (TypeError, ValueError, OverflowError):
             logger.warning(
                 f"配置 {field_name}={value!r} 不是有效数字，"
                 f"已回退默认值 {default}"
             )
             return float(default)
-
     # ------------------ 站点解析 ------------------
 
     def _load_site_records(self) -> List[Dict[str, Any]]:
