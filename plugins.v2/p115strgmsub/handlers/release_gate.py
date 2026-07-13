@@ -620,25 +620,33 @@ class ReleaseGateStore:
     def _tv_probe_due(
         self,
         state: Dict[str, Any],
+        allow_released_unknown: bool = False,
     ) -> bool:
         """
-        判断季度是否允许执行播出前泄漏探测。
+        判断季度是否允许执行泄漏探测。
 
-        一季只在首播前探测；季度已经开播后，
-        后续集数应等待各自的 air_date。
+        未开播季度可以在首播前探测；
+        已开播季度只对 air_date 未知的缺失集，
+        按 14 天周期进行探测。
         """
-        if state.get("released"):
+        if (
+            state.get("released")
+            and not allow_released_unknown
+        ):
             return False
 
         if not state.get("leak_probe_done"):
             return True
 
-        next_air_date = self._parse_tmdb_date(
-            state.get("next_known_release_date")
-        )
+        # 未开播季度有明确下一播出日期时，
+        # 到达该日期即可重新查询。
+        if not state.get("released"):
+            next_air_date = self._parse_tmdb_date(
+                state.get("next_known_release_date")
+            )
 
-        if next_air_date:
-            return self.today() >= next_air_date
+            if next_air_date:
+                return self.today() >= next_air_date
 
         next_probe_at = self._parse_datetime(
             state.get("next_leak_probe_at")
@@ -792,7 +800,15 @@ class ReleaseGateStore:
             })
             return decision
 
-        probe_due = self._tv_probe_due(state)
+        unknown_only_probe = bool(
+            state.get("released")
+            and unknown_missing
+        )
+
+        probe_due = self._tv_probe_due(
+            state,
+            allow_released_unknown=unknown_only_probe,
+        )
 
         if probe_due:
             decision.update({
@@ -800,13 +816,17 @@ class ReleaseGateStore:
                 "ayclub_first": True,
                 "probe_due": True,
                 "reason": (
-                    "preair_leak_probe_due"
-                    if future_missing
-                    else "unknown_air_date_probe_due"
+                    "unknown_air_date_probe_due"
+                    if unknown_only_probe or not future_missing
+                    else "preair_leak_probe_due"
                 ),
-                # 泄漏探测时查询真正缺失的集数，
-                # 包括尚未播出的剧集。
-                "ayclub_episodes": missing,
+                # 已开播后只探测日期未知的缺失集，
+                # 不连带查询明确尚未播出的剧集。
+                "ayclub_episodes": (
+                    unknown_missing
+                    if unknown_only_probe
+                    else missing
+                ),
             })
             return decision
 
@@ -835,15 +855,16 @@ class ReleaseGateStore:
 
         state = self.get_tv(tmdb_id, season)
 
-        if state.get("released"):
-            return
-
         now = self.now()
         next_air_date = self._parse_tmdb_date(
             state.get("next_known_release_date")
         )
 
-        if next_air_date and next_air_date > self.today():
+        if (
+            not state.get("released")
+            and next_air_date
+            and next_air_date > self.today()
+        ):
             next_probe_at = self._timezone().localize(
                 datetime.datetime.combine(
                     next_air_date,
