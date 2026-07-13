@@ -142,7 +142,42 @@ class SearchHandler:
             sources.insert(0, "ayclub")
 
         return sources
+        
+    def reset_ayclub_status(self) -> None:
+        """在一次新的门禁查询前重置 AYCLUB 查询状态。"""
+        if not self._ayclub_client:
+            return
 
+        self._ayclub_client.last_status = "idle"
+        self._ayclub_client.last_error = ""
+
+    def get_ayclub_last_status(self) -> str:
+        """读取最近一次 AYCLUB 查询状态。"""
+        if not self._ayclub_client:
+            return "disabled"
+
+        return str(
+            getattr(
+                self._ayclub_client,
+                "last_status",
+                "idle",
+            )
+        )
+
+    def get_ayclub_last_error(self) -> str:
+        """读取最近一次 AYCLUB 查询错误。"""
+        if not self._ayclub_client:
+            return ""
+
+        return str(
+            getattr(
+                self._ayclub_client,
+                "last_error",
+                "",
+            )
+            or ""
+        )
+        
     def search_resources(
         self,
         mediainfo: MediaInfo,
