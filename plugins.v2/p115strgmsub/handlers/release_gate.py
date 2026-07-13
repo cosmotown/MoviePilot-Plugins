@@ -599,7 +599,7 @@ class ReleaseGateStore:
             f"电影 TMDB {tmdb_id} 泄漏探测无结果，"
             f"下一次探测时间：{state['next_leak_probe_at']}"
         )
-        @staticmethod
+    @staticmethod
     def _normalize_episode_numbers(
         episodes: List[int],
     ) -> List[int]:
