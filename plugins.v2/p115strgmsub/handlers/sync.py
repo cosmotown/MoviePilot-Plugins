@@ -3,6 +3,7 @@
 负责核心的同步逻辑：处理电影订阅、处理电视剧订阅
 """
 import datetime
+import hashlib
 from typing import List, Dict, Any, Set, Optional, Callable
 
 from app.core.config import global_vars
@@ -79,6 +80,22 @@ class SyncHandler:
             save_data_func=save_data_func,
         )
 
+    @staticmethod
+    def _safe_share_ref(share_url: str) -> str:
+        """
+        生成不可逆的分享链接标识。
+
+        完整分享链接只在当前转存流程内使用，
+        不写入日志、插件历史或下载历史。
+        """
+        if not share_url:
+            return "115share#empty"
+
+        digest = hashlib.sha256(
+            share_url.encode("utf-8")
+        ).hexdigest()[:12]
+
+        return f"115share#{digest}"
     def _resolve_target_root(
         self,
         share_url: str,
@@ -272,18 +289,27 @@ class SyncHandler:
                 if not share_url:
                     continue
 
-                logger.info(f"检查分享：{resource_title} - {share_url}")
+                share_ref = self._safe_share_ref(share_url)
+
+                logger.info(
+                    f"检查分享：{resource_title} - {share_ref}"
+                )
 
                 try:
                     # 先检查分享链接是否有效
                     share_status = self._p115_manager.check_share_status(share_url)
                     if not share_status.is_valid:
-                        logger.warning(f"分享链接无效：{share_url}，原因：{share_status.status_text}")
+                        logger.warning(
+                            f"分享链接无效：{share_ref}，"
+                            f"原因：{share_status.status_text}"
+                        )
                         continue
 
                     share_files = self._p115_manager.list_share_files(share_url)
                     if not share_files:
-                        logger.info(f"分享链接无内容：{share_url}")
+                        logger.info(
+                            f"分享链接无内容：{share_ref}"
+                        )
                         continue
 
                     # 匹配电影文件
@@ -333,7 +359,7 @@ class SyncHandler:
 
                         # 执行转存
                         success = self._p115_manager.transfer_file(
-                            share_url=share_url,
+                            "share_ref": share_ref,
                             file_id=matched_file.get("id"),
                             save_path=save_dir
                         )
@@ -387,7 +413,10 @@ class SyncHandler:
                                     torrent_site="115网盘",
                                     username="P115StrgmSub",
                                     date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    note={"source": f"Subscribe|{subscribe.name}", "share_url": share_url}
+                                    note={
+                                        "source": f"Subscribe|{subscribe.name}",
+                                        "share_ref": share_ref,
+                                    }
                                 )
                                 logger.debug(f"已记录电影 {mediainfo.title} 下载历史")
                             except Exception as e:
@@ -410,7 +439,10 @@ class SyncHandler:
                             logger.error(f"转存失败：{mediainfo.title}")
 
                 except Exception as e:
-                    logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
+                    logger.error(
+                        f"处理分享链接出错：{share_ref}，"
+                        f"错误类型：{type(e).__name__}"
+                    )
                     continue
                     
             # 未发布电影的泄漏探测，只有 AYCLUB 明确返回
@@ -877,13 +909,20 @@ class SyncHandler:
                     if not share_url:
                         continue
 
-                    logger.info(f"检查分享：{resource_title} - {share_url}")
+                    share_ref = self._safe_share_ref(share_url)
+
+                    logger.info(
+                        f"检查分享：{resource_title} - {share_ref}"
+                    )
 
                     try:
                         # 检查分享链接是否有效
                         share_status = self._p115_manager.check_share_status(share_url)
                         if not share_status.is_valid:
-                            logger.warning(f"分享链接无效：{share_url}，原因：{share_status.status_text}")
+                            logger.warning(
+                                f"分享链接无效：{share_ref}，"
+                                f"原因：{share_status.status_text}"
+                            )
                             continue
 
                         # 列出分享内容
@@ -892,7 +931,9 @@ class SyncHandler:
                             target_season=(season if self._skip_other_season_dirs else None)
                         )
                         if not share_files:
-                            logger.info(f"分享链接无内容：{share_url}")
+                            logger.info(
+                                f"分享链接无内容：{share_ref}"
+                            )
                             continue
 
                         logger.info(f"分享包含 {len(share_files)} 个文件/目录")
@@ -1012,7 +1053,7 @@ class SyncHandler:
                         logger.info(f"准备批量转存 {len(file_ids)} 个文件到: {save_dir}")
 
                         success_ids, failed_ids = self._p115_manager.transfer_files_batch(
-                            share_url=share_url,
+                            "share_ref": share_ref,
                             file_ids=file_ids,
                             save_path=save_dir,
                             batch_size=self._batch_size
@@ -1098,12 +1139,15 @@ class SyncHandler:
                                     episodes=episodes_str,
                                     image=mediainfo.get_poster_image(),
                                     downloader="115网盘",
-                                    download_hash=share_url,
+                                    download_hash=share_ref,
                                     torrent_name=resource_title,
                                     torrent_site="115网盘",
                                     username="P115StrgmSub",
                                     date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    note={"source": f"Subscribe|{subscribe.name}", "share_url": share_url}
+                                    note={
+                                        "source": f"Subscribe|{subscribe.name}",
+                                        "share_ref": share_ref,
+                                    }
                                 )
                                 logger.debug(f"已记录 {mediainfo.title} S{season:02d} {episodes_str} 下载历史")
                             except Exception as e:
@@ -1113,7 +1157,10 @@ class SyncHandler:
                             break
 
                     except Exception as e:
-                        logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
+                        logger.error(
+                            f"处理分享链接出错：{share_ref}，"
+                            f"错误类型：{type(e).__name__}"
+                        )
                         continue
 
                 # 当前源处理完成
