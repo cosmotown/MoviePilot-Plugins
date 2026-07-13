@@ -599,6 +599,277 @@ class ReleaseGateStore:
             f"电影 TMDB {tmdb_id} 泄漏探测无结果，"
             f"下一次探测时间：{state['next_leak_probe_at']}"
         )
+        @staticmethod
+    def _normalize_episode_numbers(
+        episodes: List[int],
+    ) -> List[int]:
+        """清洗并排序集数列表。"""
+        normalized = set()
+
+        for episode in episodes or []:
+            try:
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                continue
+
+            if episode_number > 0:
+                normalized.add(episode_number)
+
+        return sorted(normalized)
+
+    def _tv_probe_due(
+        self,
+        state: Dict[str, Any],
+    ) -> bool:
+        """
+        判断季度是否允许执行播出前泄漏探测。
+
+        一季只在首播前探测；季度已经开播后，
+        后续集数应等待各自的 air_date。
+        """
+        if state.get("released"):
+            return False
+
+        if not state.get("leak_probe_done"):
+            return True
+
+        next_air_date = self._parse_tmdb_date(
+            state.get("next_known_release_date")
+        )
+
+        if next_air_date:
+            return self.today() >= next_air_date
+
+        next_probe_at = self._parse_datetime(
+            state.get("next_leak_probe_at")
+        )
+
+        if next_probe_at:
+            return self.now() >= next_probe_at
+
+        last_probe_at = self._parse_datetime(
+            state.get("last_leak_probe_at")
+        )
+
+        if not last_probe_at:
+            return True
+
+        return self.now() >= (
+            last_probe_at + datetime.timedelta(days=14)
+        )
+
+    def evaluate_tv(
+        self,
+        tmdb_id: int,
+        season: int,
+        missing_episodes: List[int],
+        episode_air_dates: Dict[int, Optional[str]],
+        metadata_ok: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        根据季度剧集 air_date 判断 AYCLUB 搜索范围。
+
+        已播出的缺失剧集立即允许查询；
+        首播前允许一次泄漏探测；
+        已开播但下一集尚未播出时等待 air_date；
+        air_date 全部未知时每 14 天探测一次。
+        """
+        state = self.get_tv(tmdb_id, season)
+        missing = self._normalize_episode_numbers(
+            missing_episodes
+        )
+
+        base_decision = {
+            "allow_ayclub": False,
+            "ayclub_first": False,
+            "probe_due": False,
+            "released": bool(state.get("released")),
+            "reason": "no_missing_episodes",
+            "aired_episodes": [],
+            "future_episodes": [],
+            "unknown_episodes": [],
+            "ayclub_episodes": [],
+            "state": state,
+        }
+
+        if not missing:
+            return base_decision
+
+        if not metadata_ok:
+            state["last_tmdb_check_status"] = "error"
+            self.save(state)
+
+            base_decision.update({
+                "reason": "tmdb_error",
+                "state": state,
+            })
+            return base_decision
+
+        normalized_air_dates: Dict[int, Optional[str]] = {}
+
+        for episode, air_date in (
+            episode_air_dates or {}
+        ).items():
+            try:
+                episode_number = int(episode)
+            except (TypeError, ValueError):
+                continue
+
+            if episode_number > 0:
+                normalized_air_dates[episode_number] = (
+                    str(air_date)
+                    if air_date
+                    else None
+                )
+
+        today = self.today()
+        aired_missing: List[int] = []
+        future_missing: List[int] = []
+        unknown_missing: List[int] = []
+        future_dates: List[datetime.date] = []
+        all_aired_dates: List[datetime.date] = []
+
+        for air_date_value in normalized_air_dates.values():
+            air_date = self._parse_tmdb_date(
+                air_date_value
+            )
+
+            if air_date and air_date <= today:
+                all_aired_dates.append(air_date)
+
+        for episode in missing:
+            air_date = self._parse_tmdb_date(
+                normalized_air_dates.get(episode)
+            )
+
+            if not air_date:
+                unknown_missing.append(episode)
+            elif air_date <= today:
+                aired_missing.append(episode)
+            else:
+                future_missing.append(episode)
+                future_dates.append(air_date)
+
+        state["last_tmdb_check_date"] = today.isoformat()
+        state["last_tmdb_check_status"] = "ok"
+        state["next_known_release_date"] = (
+            min(future_dates).isoformat()
+            if future_dates
+            else None
+        )
+
+        # 以整季是否已有任意一集播出判断季度是否已经开播，
+        # 不能只看当前缺失的集数。
+        if all_aired_dates:
+            state["released"] = True
+            state["release_signal"] = (
+                f"episode_air_date:"
+                f"{min(all_aired_dates).isoformat()}"
+            )
+
+        self.save(state)
+
+        decision = {
+            "allow_ayclub": False,
+            "ayclub_first": False,
+            "probe_due": False,
+            "released": bool(state.get("released")),
+            "reason": "",
+            "aired_episodes": aired_missing,
+            "future_episodes": future_missing,
+            "unknown_episodes": unknown_missing,
+            "ayclub_episodes": [],
+            "state": state,
+        }
+
+        # 已播出的缺失集立即查询，不受泄漏探测周期限制。
+        if aired_missing:
+            decision.update({
+                "allow_ayclub": True,
+                "ayclub_first": True,
+                "reason": "aired_missing_episodes",
+                "ayclub_episodes": aired_missing,
+            })
+            return decision
+
+        probe_due = self._tv_probe_due(state)
+
+        if probe_due:
+            decision.update({
+                "allow_ayclub": True,
+                "ayclub_first": True,
+                "probe_due": True,
+                "reason": (
+                    "preair_leak_probe_due"
+                    if future_missing
+                    else "unknown_air_date_probe_due"
+                ),
+                # 泄漏探测时查询真正缺失的集数，
+                # 包括尚未播出的剧集。
+                "ayclub_episodes": missing,
+            })
+            return decision
+
+        if future_missing:
+            decision["reason"] = "waiting_next_air_date"
+        elif unknown_missing:
+            decision["reason"] = "unknown_air_date_probe_wait"
+        else:
+            decision["reason"] = "no_searchable_episode"
+
+        return decision
+
+    def mark_tv_probe_result(
+        self,
+        tmdb_id: int,
+        season: int,
+        search_status: str,
+    ) -> None:
+        """
+        记录季度播出前泄漏探测结果。
+
+        只有 AYCLUB 明确返回 ok_empty 才消耗探测机会。
+        """
+        if search_status != "ok_empty":
+            return
+
+        state = self.get_tv(tmdb_id, season)
+
+        if state.get("released"):
+            return
+
+        now = self.now()
+        next_air_date = self._parse_tmdb_date(
+            state.get("next_known_release_date")
+        )
+
+        if next_air_date and next_air_date > self.today():
+            next_probe_at = self._timezone().localize(
+                datetime.datetime.combine(
+                    next_air_date,
+                    datetime.time.min,
+                )
+            )
+        else:
+            # 没有可靠的下一集日期时，每 14 天再探测一次。
+            next_probe_at = (
+                now + datetime.timedelta(days=14)
+            )
+
+        state["leak_probe_done"] = True
+        state["last_leak_probe_at"] = now.isoformat()
+        state["next_leak_probe_at"] = (
+            next_probe_at.isoformat()
+        )
+
+        self.save(state)
+
+        logger.info(
+            f"电视剧 TMDB {tmdb_id} S{season} "
+            f"泄漏探测无结果，下一次允许时间："
+            f"{state['next_leak_probe_at']}"
+        )
+
     def save(
         self,
         state: Dict[str, Any],
