@@ -210,9 +210,7 @@ class SyncHandler:
             )
 
             for resource in resource_iterator:
-                resource_found = True
-                if movie_transferred:
-                    break
+                resource_found = True                
 
                 share_url = resource.get("url", "")
                 resource_title = resource.get("title", "")
@@ -364,8 +362,11 @@ class SyncHandler:
                             # 订阅完成，清除该订阅的历史积分记录
                             if hasattr(self._search_handler, 'clear_sub_points'):
                                 self._search_handler.clear_sub_points(sub_key)
+
+                            # 实际转存成功，立即结束资源迭代，
+                            # 避免生成器继续查询后续搜索源
+                            break
                         else:
-                            logger.error(f"转存失败：{mediainfo.title}")
 
                 except Exception as e:
                     logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
