@@ -6,6 +6,7 @@ AYCLUB Telegram 影视机器人桥接客户端。
 """
 
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -41,7 +42,38 @@ class AyclubClient:
     @property
     def is_ready(self) -> bool:
         return bool(self.enabled and self.base_url)
+        
+    @staticmethod
+    def _is_allowed_share_url(share_url: str) -> bool:
+        """
+        只允许 HTTPS 的 115cdn.com 官方域名链接。
 
+        防止桥接服务异常或被篡改时，把其他地址交给
+        115 客户端或后续分类服务处理。
+        """
+        try:
+            parsed = urlparse(share_url)
+            hostname = (
+                parsed.hostname or ""
+            ).lower().rstrip(".")
+            port = parsed.port
+        except (TypeError, ValueError):
+            return False
+
+        return (
+            parsed.scheme.lower() == "https"
+            and not parsed.username
+            and not parsed.password
+            and port in (None, 443)
+            and (
+                hostname == "115cdn.com"
+                or hostname.endswith(".115cdn.com")
+            )
+            and bool(
+                parsed.path
+                and parsed.path != "/"
+            )
+        )    
     def health(self) -> bool:
         """检查桥接服务是否正常且 Telegram Session 已授权。"""
         if not self.is_ready:
@@ -180,7 +212,13 @@ class AyclubClient:
                 share_url = (item.get("source") or "").strip()
                 resource_title = (item.get("title") or "").strip()
 
-                if not share_url or not resource_title:
+                if (
+                    not share_url
+                    or not resource_title
+                    or not self._is_allowed_share_url(
+                        share_url
+                    )
+                ):
                     continue
 
                 results.append({
