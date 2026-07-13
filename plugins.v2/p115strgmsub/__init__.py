@@ -735,7 +735,6 @@ class P115StrgmSub(_PluginBase):
                 20,
                 "hdhive_max_points_per_sub",
             )
-            self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
             self._hdhive_username = config.get("hdhive_username", "")
             self._hdhive_password = config.get("hdhive_password", "")
             self._hdhive_cookie = config.get("hdhive_cookie", "")
