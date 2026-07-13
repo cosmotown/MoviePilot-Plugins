@@ -79,7 +79,11 @@ class SearchHandler:
         self._ayclub_client = ayclub_client
         self._ayclub_enabled = ayclub_enabled
 
-    def get_enabled_sources(self) -> List[str]:
+    def get_enabled_sources(
+        self,
+        ayclub_first: bool = False,
+        allow_ayclub: bool = True,
+    ) -> List[str]:
         """
         获取已启用且可用的搜索源列表，按优先级排序
 
@@ -110,7 +114,8 @@ class SearchHandler:
             
         # AYCLUB Telegram
         if (
-            self._ayclub_enabled
+            allow_ayclub
+            and self._ayclub_enabled
             and self._ayclub_client
             and self._ayclub_client.is_ready
         ):
@@ -118,17 +123,34 @@ class SearchHandler:
 
         # 应用用户自定义优先级
         if self._search_source_order:
-            sources = [s for s in self._search_source_order if s in available]
-            sources += [s for s in available if s not in sources]
-            return sources
+            sources = [
+                source
+                for source in self._search_source_order
+                if source in available
+            ]
+            sources += [
+                source
+                for source in available
+                if source not in sources
+            ]
+        else:
+            sources = list(available)
 
-        return available
+        # 发布门禁允许 AYCLUB 时，可动态提升为第一搜索源
+        if ayclub_first and "ayclub" in sources:
+            sources.remove("ayclub")
+            sources.insert(0, "ayclub")
+
+        return sources
 
     def search_resources(
         self,
         mediainfo: MediaInfo,
         media_type: MediaType,
-        season: Optional[int] = None
+        season: Optional[int] = None,
+        episodes: Optional[List[int]] = None,
+        ayclub_first: bool = False,
+        allow_ayclub: bool = True,
     ) -> List[Dict]:
         """
         统一的资源搜索方法，支持电影和电视剧
@@ -142,10 +164,19 @@ class SearchHandler:
         :param season: 季号（电视剧必需）
         :return: 115网盘资源列表
         """
-        sources = self.get_enabled_sources()
+        sources = self.get_enabled_sources(
+            ayclub_first=ayclub_first,
+            allow_ayclub=allow_ayclub,
+        )
 
         for source in sources:
-            results = self.search_single_source(source, mediainfo, media_type, season)
+            results = self.search_single_source(
+                source=source,
+                mediainfo=mediainfo,
+                media_type=media_type,
+                season=season,
+                episodes=episodes,
+            )
             if results:
                 return results
             else:
@@ -161,7 +192,8 @@ class SearchHandler:
         source: str,
         mediainfo: MediaInfo,
         media_type: MediaType,
-        season: Optional[int] = None
+        season: Optional[int] = None,
+        episodes: Optional[List[int]] = None,
     ) -> List[Dict]:
         """
         使用指定的单一搜索源查询资源
@@ -189,6 +221,7 @@ class SearchHandler:
                 mediainfo=mediainfo,
                 media_type=media_type,
                 season=season,
+                episodes=episodes,
             )
         else:
             logger.warning(f"未知的搜索源: {source}")
