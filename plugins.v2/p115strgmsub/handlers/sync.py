@@ -359,7 +359,7 @@ class SyncHandler:
 
                         # 执行转存
                         success = self._p115_manager.transfer_file(
-                            "share_ref": share_ref,
+                            share_url=share_url,
                             file_id=matched_file.get("id"),
                             save_path=save_dir
                         )
@@ -370,7 +370,7 @@ class SyncHandler:
                             "year": mediainfo.year,
                             "type": "电影",
                             "status": "成功" if success else "失败",
-                            "share_url": share_url,
+                            "share_ref": share_ref,
                             "file_name": file_name,
                             "filter_score": current_score,
                             "perfect_match": is_perfect,
@@ -1053,7 +1053,7 @@ class SyncHandler:
                         logger.info(f"准备批量转存 {len(file_ids)} 个文件到: {save_dir}")
 
                         success_ids, failed_ids = self._p115_manager.transfer_files_batch(
-                            "share_ref": share_ref,
+                            share_url=share_url,
                             file_ids=file_ids,
                             save_path=save_dir,
                             batch_size=self._batch_size
@@ -1078,7 +1078,7 @@ class SyncHandler:
                                 "episode": episode,
                                 "type": "电视剧",
                                 "status": "成功" if success else "失败",
-                                "share_url": share_url,
+                                "share_ref": share_ref,
                                 "file_name": file_name,
                                 "filter_score": current_score,
                                 "perfect_match": is_perfect,
