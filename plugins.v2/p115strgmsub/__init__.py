@@ -196,6 +196,38 @@ class P115StrgmSub(_PluginBase):
         min_delta = min(fire_times[i + 1] - fire_times[i] for i in range(len(fire_times) - 1))
         return min_delta >= datetime.timedelta(hours=min_hours)
 
+    @staticmethod
+    def _safe_int(
+        value: Any,
+        default: int,
+        field_name: str,
+    ) -> int:
+        """安全读取整数配置，格式错误时回退默认值。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"配置 {field_name}={value!r} 不是有效整数，"
+                f"已回退默认值 {default}"
+            )
+            return int(default)
+
+    @staticmethod
+    def _safe_float(
+        value: Any,
+        default: float,
+        field_name: str,
+    ) -> float:
+        """安全读取浮点数配置，格式错误时回退默认值。"""
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"配置 {field_name}={value!r} 不是有效数字，"
+                f"已回退默认值 {default}"
+            )
+            return float(default)
+
     # ------------------ 站点解析 ------------------
 
     def _load_site_records(self) -> List[Dict[str, Any]]:
@@ -650,18 +682,22 @@ class P115StrgmSub(_PluginBase):
                 )
                 or ""
             ).strip()
-            self._ayclub_timeout = int(
-                config.get("ayclub_timeout", 120)
-                or 120
+            self._ayclub_timeout = self._safe_int(
+                config.get("ayclub_timeout", 120),
+                120,
+                "ayclub_timeout",
             )
             self._ayclub_max_pages = min(
                 max(
-                    int(config.get("ayclub_max_pages", 5) or 5),
+                    self._safe_int(
+                        config.get("ayclub_max_pages", 5),
+                        5,
+                        "ayclub_max_pages",
+                    ),
                     1,
                 ),
                 10,
             )
-
             self._save_path = config.get("save_path", "/我的接收/MoviePilot/TV")
             self._movie_save_path = config.get("movie_save_path", "/我的接收/MoviePilot/Movie")
             self._only_115 = config.get("only_115", True)
@@ -683,17 +719,42 @@ class P115StrgmSub(_PluginBase):
             self._hdhive_auth_code = (config.get("hdhive_auth_code", "") or "").strip()
             self._hdhive_access_token = config.get("hdhive_access_token", "")
             self._hdhive_refresh_token = config.get("hdhive_refresh_token", "")
-            self._hdhive_token_expires_at = float(config.get("hdhive_token_expires_at", 0) or 0)
+            self._hdhive_token_expires_at = self._safe_float(
+                config.get("hdhive_token_expires_at", 0),
+                0,
+                "hdhive_token_expires_at",
+            )
             self._hdhive_auto_unlock = config.get("hdhive_auto_unlock", False)
-            self._hdhive_max_unlock_points = int(config.get("hdhive_max_unlock_points", 50) or 50)
+            self._hdhive_max_unlock_points = self._safe_int(
+                config.get("hdhive_max_unlock_points", 50),
+                50,
+                "hdhive_max_unlock_points",
+            )
+            self._hdhive_max_points_per_sub = self._safe_int(
+                config.get("hdhive_max_points_per_sub", 20),
+                20,
+                "hdhive_max_points_per_sub",
+            )
             self._hdhive_max_points_per_sub = int(config.get("hdhive_max_points_per_sub", 20) or 20)
             self._hdhive_username = config.get("hdhive_username", "")
             self._hdhive_password = config.get("hdhive_password", "")
             self._hdhive_cookie = config.get("hdhive_cookie", "")
             self._hdhive_auto_refresh = config.get("hdhive_auto_refresh", False)
-            self._hdhive_refresh_before = int(config.get("hdhive_refresh_before", 86400) or 86400)
-            self._max_transfer_per_sync = int(config.get("max_transfer_per_sync", 50) or 50)
-            self._batch_size = int(config.get("batch_size", 20) or 20)
+            self._hdhive_refresh_before = self._safe_int(
+                config.get("hdhive_refresh_before", 86400),
+                86400,
+                "hdhive_refresh_before",
+            )
+            self._max_transfer_per_sync = self._safe_int(
+                config.get("max_transfer_per_sync", 50),
+                50,
+                "max_transfer_per_sync",
+            )
+            self._batch_size = self._safe_int(
+                config.get("batch_size", 20),
+                20,
+                "batch_size",
+            )
             self._skip_other_season_dirs = config.get("skip_other_season_dirs", True)
             
             # OpenClaw 七分类服务配置
@@ -711,9 +772,10 @@ class P115StrgmSub(_PluginBase):
                 config.get("classifier_token", "")
                 or ""
             ).strip()
-            self._classifier_timeout = int(
-                config.get("classifier_timeout", 120)
-                or 120
+            self._classifier_timeout = self._safe_int(
+                config.get("classifier_timeout", 120),
+                120,
+                "classifier_timeout",
             )
             
             # 搜索源优先级（兼容逗号分隔字符串）
@@ -733,11 +795,25 @@ class P115StrgmSub(_PluginBase):
             else:
                 self._unblock_site_names = raw_sites or []
 
-            self._unblock_delay_minutes = int(config.get("unblock_delay_minutes", self._unblock_delay_minutes))
-            self._system_subscribe_window_hours = float(
-                config.get("unblock_window_hours", config.get("system_subscribe_window_hours", self._system_subscribe_window_hours))
+            self._unblock_delay_minutes = self._safe_int(
+                config.get(
+                    "unblock_delay_minutes",
+                    self._unblock_delay_minutes,
+                ),
+                self._unblock_delay_minutes,
+                "unblock_delay_minutes",
             )
-
+            self._system_subscribe_window_hours = self._safe_float(
+                config.get(
+                    "unblock_window_hours",
+                    config.get(
+                        "system_subscribe_window_hours",
+                        self._system_subscribe_window_hours,
+                    ),
+                ),
+                self._system_subscribe_window_hours,
+                "unblock_window_hours",
+            )
             self._block_system_subscribe = bool(config.get("block_system_subscribe", False))
 
         # 初始化客户端/handlers
