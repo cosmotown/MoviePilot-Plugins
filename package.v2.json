@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集。",
     "labels": "订阅,115网盘",
-    "version": "1.6.0",
+    "version": "1.7.0",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.7.0": "新增电影与电视剧发布门禁：基于 TMDB Watch Providers、发行日期和剧集 air_date 控制 AYCLUB 查询；支持首轮及14天泄漏探测、查询缓存和季度资源包；修复系统订阅 PT 抢跑、缓存空结果误消耗探测机会及已发布状态被清理问题；新增115分享链接脱敏、AYCLUB链接来源校验和数字配置安全解析。",
       "v1.6.0": "新增 AYCLUB Telegram 搜索源：通过本机桥接服务查询 @ayclub_bot，支持基于 TMDB ID、标题、年份和季数精确匹配115资源，并支持自定义搜索优先级、超时和翻页数量。",
       "v1.5.6": "修复115订阅创建时原生PT抢跑问题：屏蔽状态将系统订阅站点锁定为115虚拟站点，恢复窗口自动还原PT站点；115虚拟站点保持禁用，避免站点检测助手反复报错。",
       "v1.5.5": "修复 PanSou 服务偶发返回错误重定向导致搜索失败的问题，遇到异常 3xx 时自动重试原地址。",
