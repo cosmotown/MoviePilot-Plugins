@@ -77,7 +77,7 @@ class AyclubClient:
         - ok_matched：成功找到有效资源
         - ok_empty：查询成功，但确实没有匹配资源
         - invalid_result：接口称已匹配，但没有可用资源项
-        - timeout：http_error / error：查询失败
+        - timeout / http_error / error：查询失败
         - disabled / invalid_request：未执行有效查询
         """
         self.last_status = "attempted"
