@@ -12,7 +12,7 @@ import pytz
 
 from app.core.config import settings
 from app.log import logger
-from app.modules.themoviedb.tmdbapi import TmdbApi
+from app.modules.themoviedb.tmdbv3api import Movie
 
 
 class ReleaseGateStore:
@@ -198,18 +198,26 @@ class ReleaseGateStore:
         tmdb_id: int,
     ) -> Dict[str, Any]:
         """查询电影 Watch Providers。"""
-        api = TmdbApi()
-        result = api.movie.watch_providers(int(tmdb_id))
-        return result if isinstance(result, dict) else {}
+        client = Movie()
+
+        try:
+            result = client.watch_providers(int(tmdb_id))
+            return result if isinstance(result, dict) else {}
+        finally:
+            client.close()
 
     @staticmethod
     def _fetch_movie_release_dates(
         tmdb_id: int,
     ) -> List[Dict[str, Any]]:
         """查询电影各地区发行日期。"""
-        api = TmdbApi()
-        result = api.movie.release_dates(int(tmdb_id))
-        return result if isinstance(result, list) else []
+        client = Movie()
+
+        try:
+            result = client.release_dates(int(tmdb_id))
+            return result if isinstance(result, list) else []
+        finally:
+            client.close()
 
     @staticmethod
     def _analyze_watch_providers(
