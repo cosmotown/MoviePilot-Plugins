@@ -193,6 +193,35 @@ class SyncHandler:
                 logger.warn(f"无法识别媒体信息：{subscribe.name}")
                 return transferred_count            
 
+            # 判断本次是否允许查询 AYCLUB。
+            # 门禁只控制 AYCLUB，不影响 PanSou、HDHive、Nullbr。
+            movie_gate = {
+                "allow_ayclub": False,
+                "ayclub_first": False,
+                "probe_due": False,
+                "released": False,
+                "reason": "missing_tmdb_id",
+            }
+
+            if mediainfo.tmdb_id:
+                movie_gate = self._release_gate.evaluate_movie(
+                    int(mediainfo.tmdb_id)
+                )
+            else:
+                logger.info(
+                    f"电影 {mediainfo.title} 缺少 TMDB ID，"
+                    f"本次不查询 AYCLUB"
+                )
+
+            logger.info(
+                f"电影 {mediainfo.title} AYCLUB 发布门禁："
+                f"允许={movie_gate.get('allow_ayclub')}，"
+                f"优先={movie_gate.get('ayclub_first')}，"
+                f"原因={movie_gate.get('reason')}"
+            )
+
+            # 防止读取到上一个订阅遗留的 AYCLUB 查询状态
+            self._search_handler.reset_ayclub_status()      
             # 创建订阅过滤条件
             subscribe_filter = SubscribeFilter(
                 quality=subscribe.quality,
@@ -212,6 +241,12 @@ class SyncHandler:
             resource_iterator = self._search_handler.iter_resources(
                 mediainfo=mediainfo,
                 media_type=MediaType.MOVIE,
+                ayclub_first=bool(
+                    movie_gate.get("ayclub_first")
+                ),
+                allow_ayclub=bool(
+                    movie_gate.get("allow_ayclub")
+                ),
             )
 
             for resource in resource_iterator:
@@ -377,6 +412,26 @@ class SyncHandler:
                 except Exception as e:
                     logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
                     continue
+                    
+            # 未发布电影的泄漏探测，只有 AYCLUB 明确返回
+            # ok_empty 时才会消耗本次机会；超时和报错不消耗。
+            if (
+                movie_gate.get("probe_due")
+                and mediainfo.tmdb_id
+            ):
+                ayclub_status = (
+                    self._search_handler.get_ayclub_last_status()
+                )
+
+                self._release_gate.mark_movie_probe_result(
+                    tmdb_id=int(mediainfo.tmdb_id),
+                    search_status=ayclub_status,
+                )
+
+                logger.info(
+                    f"电影 {mediainfo.title} AYCLUB 泄漏探测状态："
+                    f"{ayclub_status}"
+                )
 
             if not resource_found:
                 logger.info(
