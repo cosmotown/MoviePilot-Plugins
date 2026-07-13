@@ -186,19 +186,7 @@ class SyncHandler:
             )
             if not mediainfo:
                 logger.warn(f"无法识别媒体信息：{subscribe.name}")
-                return transferred_count
-
-            # 搜索网盘资源
-            p115_results = self._search_handler.search_resources(
-                mediainfo=mediainfo,
-                media_type=MediaType.MOVIE
-            )
-
-            if not p115_results:
-                logger.info(f"未找到电影 {mediainfo.title} 的 115 网盘资源")
-                return transferred_count
-
-            logger.info(f"找到 {len(p115_results)} 个 115 网盘资源")
+                return transferred_count            
 
             # 创建订阅过滤条件
             subscribe_filter = SubscribeFilter(
@@ -211,9 +199,18 @@ class SyncHandler:
                 mode_text = "洗版模式" if is_best_version else "严格模式"
                 logger.info(f"电影 {subscribe.name} 过滤条件({mode_text}) - 质量: {subscribe.quality}, 分辨率: {subscribe.resolution}, 特效: {subscribe.effect}")
 
-            # 遍历搜索结果，尝试找到并转存电影
+            # 延迟逐源搜索：只有当前来源的候选资源全部不可用，
+            # 才真正查询下一个来源
             movie_transferred = False
-            for resource in p115_results:
+            resource_found = False
+
+            resource_iterator = self._search_handler.iter_resources(
+                mediainfo=mediainfo,
+                media_type=MediaType.MOVIE,
+            )
+
+            for resource in resource_iterator:
+                resource_found = True
                 if movie_transferred:
                     break
 
@@ -374,6 +371,15 @@ class SyncHandler:
                     logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
                     continue
 
+            if not resource_found:
+                logger.info(
+                    f"未找到电影 {mediainfo.title} 的任何 115 网盘候选资源"
+                )
+            elif not movie_transferred:
+                logger.info(
+                    f"电影 {mediainfo.title} 的候选资源均无效、"
+                    f"不匹配过滤条件或转存失败"
+                )
         except Exception as e:
             logger.error(f"处理电影订阅 {subscribe.name} 出错：{str(e)}")
 
