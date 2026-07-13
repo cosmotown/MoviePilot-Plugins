@@ -621,38 +621,118 @@ class SyncHandler:
                         self._search_handler.clear_sub_points(sub_key)
                 return transferred_count
 
-            # 过滤掉尚未播出的剧集，避免浪费搜索和解锁资源
+            # 根据 TMDB 剧集播出日期决定不同来源可查询的集数。
+            # AYCLUB 受发布门禁控制；其他来源仍可查询已播出或日期未知的缺失集。
+            all_missing_episodes = list(missing_episodes)
+            episode_air_dates: Dict[int, Optional[str]] = {}
+            metadata_ok = True
+
+            tv_gate = {
+                "allow_ayclub": False,
+                "ayclub_first": False,
+                "probe_due": False,
+                "released": False,
+                "reason": "missing_tmdb_id",
+                "aired_episodes": [],
+                "future_episodes": [],
+                "unknown_episodes": [],
+                "ayclub_episodes": [],
+            }
+
             if mediainfo.tmdb_id:
                 try:
                     from app.chain.tmdb import TmdbChain
+
                     tmdb_episodes = TmdbChain().tmdb_episodes(
-                        tmdbid=mediainfo.tmdb_id, season=season
+                        tmdbid=mediainfo.tmdb_id,
+                        season=season,
                     )
-                    if tmdb_episodes:
-                        today = datetime.date.today().isoformat()
-                        aired_episodes = set()
-                        for ep in tmdb_episodes:
-                            if ep.air_date and ep.air_date <= today and ep.episode_number:
-                                aired_episodes.add(ep.episode_number)
-                        if aired_episodes:
-                            not_aired = [ep for ep in missing_episodes if ep not in aired_episodes]
-                            if not_aired:
-                                missing_episodes = [ep for ep in missing_episodes if ep in aired_episodes]
-                                logger.info(
-                                    f"{mediainfo.title_year} S{season} 跳过 {len(not_aired)} 集未播出剧集：{not_aired}"
-                                )
-                                if not missing_episodes:
-                                    logger.info(f"{mediainfo.title_year} S{season} 所有缺失剧集均未播出，跳过")
-                                    return transferred_count
-                        else:
-                            logger.info(f"{mediainfo.title_year} S{season} TMDB剧集播出日期数据为空，跳过播出过滤")
-                    else:
-                        logger.info(f"{mediainfo.title_year} S{season} TMDB未返回剧集信息，跳过播出过滤")
-                except Exception as e:
-                    logger.warning(f"{mediainfo.title_year} S{season} 查询TMDB剧集播出日期失败：{e}，将继续处理所有缺失剧集")
 
-            logger.info(f"{mediainfo.title_year} S{season} 待转存剧集：{missing_episodes}")
+                    for episode_info in tmdb_episodes or []:
+                        episode_number = getattr(
+                            episode_info,
+                            "episode_number",
+                            None,
+                        )
 
+                        if not episode_number:
+                            continue
+
+                        episode_air_dates[int(episode_number)] = (
+                            getattr(
+                                episode_info,
+                                "air_date",
+                                None,
+                            )
+                        )
+
+                    if not tmdb_episodes:
+                        logger.info(
+                            f"{mediainfo.title_year} S{season} "
+                            f"TMDB未返回剧集信息，按播出日期未知处理"
+                        )
+
+                except Exception as error:
+                    metadata_ok = False
+                    logger.warning(
+                        f"{mediainfo.title_year} S{season} "
+                        f"查询TMDB剧集播出日期失败：{error}"
+                    )
+
+                tv_gate = self._release_gate.evaluate_tv(
+                    tmdb_id=int(mediainfo.tmdb_id),
+                    season=int(season),
+                    missing_episodes=all_missing_episodes,
+                    episode_air_dates=episode_air_dates,
+                    metadata_ok=metadata_ok,
+                )
+            else:
+                logger.info(
+                    f"{mediainfo.title_year} S{season} 缺少 TMDB ID，"
+                    f"本次不查询 AYCLUB"
+                )
+
+            # 普通来源不搜索有明确未来播出日期的集数；
+            # 日期未知的集数保持原有行为，可以继续查询。
+            standard_search_episodes = list(
+                all_missing_episodes
+            )
+
+            if mediainfo.tmdb_id and metadata_ok:
+                future_episode_set = set(
+                    tv_gate.get("future_episodes") or []
+                )
+
+                standard_search_episodes = [
+                    episode
+                    for episode in all_missing_episodes
+                    if episode not in future_episode_set
+                ]
+
+            ayclub_search_episodes = [
+                episode
+                for episode in all_missing_episodes
+                if episode in set(
+                    tv_gate.get("ayclub_episodes") or []
+                )
+            ]
+
+            # 防止读取上一个订阅遗留的 AYCLUB 查询状态。
+            self._search_handler.reset_ayclub_status()
+
+            logger.info(
+                f"{mediainfo.title_year} S{season} AYCLUB 发布门禁："
+                f"允许={tv_gate.get('allow_ayclub')}，"
+                f"优先={tv_gate.get('ayclub_first')}，"
+                f"原因={tv_gate.get('reason')}，"
+                f"查询集数={ayclub_search_episodes}"
+            )
+
+            logger.info(
+                f"{mediainfo.title_year} S{season} "
+                f"实际缺失剧集：{all_missing_episodes}；"
+                f"普通来源可查询：{standard_search_episodes}"
+            )
             # 创建订阅过滤条件
             subscribe_filter = SubscribeFilter(
                 quality=subscribe.quality,
@@ -668,7 +748,14 @@ class SyncHandler:
             success_episodes = []
 
             # 智能回退搜索：按源迭代
-            enabled_sources = self._search_handler.get_enabled_sources()
+                enabled_sources = self._search_handler.get_enabled_sources(
+                ayclub_first=bool(
+                    tv_gate.get("ayclub_first")
+                ),
+                allow_ayclub=bool(
+                    tv_gate.get("allow_ayclub")
+                ),
+            )
 
             if not enabled_sources:
                 logger.warning(f"没有可用的搜索源，跳过 {mediainfo.title} S{season} 的搜索")
@@ -752,7 +839,11 @@ class SyncHandler:
                         # 收集该分享中所有匹配的文件
                         matched_items = []
 
-                        for episode in missing_episodes[:]:
+                        for episode in [
+                            episode
+                            for episode in source_episodes
+                            if episode in missing_episodes
+                        ]:
                             matched_file = FileMatcher.match_episode_file(
                                 share_files,
                                 mediainfo.title,
