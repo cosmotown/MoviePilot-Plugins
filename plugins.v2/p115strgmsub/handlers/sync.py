@@ -19,6 +19,7 @@ from app.utils.string import StringUtils
 from ..utils import FileMatcher, SubscribeFilter
 from .search import SearchHandler
 from .subscribe import SubscribeHandler
+from .release_gate import ReleaseGateStore
 
 
 class SyncHandler:
@@ -73,6 +74,10 @@ class SyncHandler:
         self._post_message = post_message_func
         self._get_data = get_data_func
         self._save_data = save_data_func
+        self._release_gate = ReleaseGateStore(
+            get_data_func=get_data_func,
+            save_data_func=save_data_func,
+        )
 
     def _resolve_target_root(
         self,
