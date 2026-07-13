@@ -370,8 +370,6 @@ class SyncHandler:
                             logger.error(f"转存失败：{mediainfo.title}")
 
                 except Exception as e:
-
-                except Exception as e:
                     logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
                     continue
 
