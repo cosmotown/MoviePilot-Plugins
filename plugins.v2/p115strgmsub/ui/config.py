@@ -295,7 +295,7 @@ class UIConfig:
                                 'props': {
                                     'type': 'info',
                                     'variant': 'tonal',
-                                    'text': 'AYCLUB：通过本机 Telegram 桥接服务查询 @ayclub_bot，并使用 TMDB ID、标题和年份精确匹配115资源。'
+                                    'text': 'AYCLUB：通过本机 Telegram 桥接服务查询 @ayclub_bot，并使用 TMDB ID、标题和年份精确匹配115资源。电影会每日检查流媒体与发行状态，电视剧按 TMDB 剧集播出日期控制查询；流媒体可用性数据由 JustWatch 通过 TMDB 提供。'
                                 }
                             }]
                         }]
