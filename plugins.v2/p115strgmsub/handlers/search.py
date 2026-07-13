@@ -2,7 +2,7 @@
 搜索处理模块
 负责所有搜索相关逻辑：HDHive、Nullbr、PanSou
 """
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Iterator
 
 from app.core.config import settings
 from app.log import logger
@@ -186,6 +186,71 @@ class SearchHandler:
                     logger.info(f"{source.capitalize()} 未找到资源，将回退到 {'/'.join([s.capitalize() for s in remaining])} 搜索")
 
         return []
+        
+    def iter_resources(
+        self,
+        mediainfo: MediaInfo,
+        media_type: MediaType,
+        season: Optional[int] = None,
+        episodes: Optional[List[int]] = None,
+        ayclub_first: bool = False,
+        allow_ayclub: bool = True,
+    ) -> Iterator[Dict]:
+        """
+        按优先级延迟查询搜索源并逐个返回资源。
+
+        调用方停止迭代后，不会继续查询后续搜索源。
+        因此可在资源实际转存成功后立即停止，避免无意义查询。
+        """
+        sources = self.get_enabled_sources(
+            ayclub_first=ayclub_first,
+            allow_ayclub=allow_ayclub,
+        )
+
+        if not sources:
+            logger.warning("没有可用的搜索源")
+            return
+
+        for source_index, source in enumerate(sources):
+            logger.info(
+                f"[{source.upper()}] 开始查询资源"
+            )
+
+            results = self.search_single_source(
+                source=source,
+                mediainfo=mediainfo,
+                media_type=media_type,
+                season=season,
+                episodes=episodes,
+            )
+
+            if not results:
+                remaining_sources = sources[source_index + 1:]
+
+                if remaining_sources:
+                    logger.info(
+                        f"[{source.upper()}] 未找到资源，"
+                        f"将回退到 {remaining_sources[0].upper()}"
+                    )
+                else:
+                    logger.info(
+                        f"[{source.upper()}] 未找到资源，"
+                        f"已无更多可用搜索源"
+                    )
+                continue
+
+            logger.info(
+                f"[{source.upper()}] 找到 {len(results)} 个候选资源，"
+                f"开始逐个验证"
+            )
+
+            for resource in results:
+                if not isinstance(resource, dict):
+                    continue
+
+                result = dict(resource)
+                result.setdefault("search_source", source)
+                yield result
 
     def search_single_source(
         self,
