@@ -367,6 +367,9 @@ class SyncHandler:
                             # 避免生成器继续查询后续搜索源
                             break
                         else:
+                            logger.error(f"转存失败：{mediainfo.title}")
+
+                except Exception as e:
 
                 except Exception as e:
                     logger.error(f"处理分享链接出错：{share_url}, 错误：{str(e)}")
