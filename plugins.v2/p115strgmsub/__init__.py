@@ -1150,13 +1150,23 @@ class P115StrgmSub(_PluginBase):
 
     def _do_sync(self) -> bool:
         # 至少启用一个搜索源
-        if not self._pansou_enabled and not self._nullbr_enabled and not self._hdhive_enabled:
-            logger.error("搜索源均未启用（PanSou/Nullbr/HDHive），无法执行")
+        if (
+            not self._pansou_enabled
+            and not self._nullbr_enabled
+            and not self._hdhive_enabled
+            and not self._ayclub_enabled
+        ):
+            logger.error(
+                "搜索源均未启用（PanSou/Nullbr/HDHive/AYCLUB），无法执行"
+            )
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【115网盘订阅追更】配置错误",
-                    text="PanSou、Nullbr、HDHive 均未启用，请至少启用一个搜索源。"
+                    text=(
+                        "PanSou、Nullbr、HDHive、AYCLUB 均未启用，"
+                        "请至少启用一个搜索源。"
+                    )
                 )
             return False
 
