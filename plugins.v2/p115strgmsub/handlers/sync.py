@@ -748,7 +748,7 @@ class SyncHandler:
             success_episodes = []
 
             # 智能回退搜索：按源迭代
-                enabled_sources = self._search_handler.get_enabled_sources(
+            enabled_sources = self._search_handler.get_enabled_sources(
                 ayclub_first=bool(
                     tv_gate.get("ayclub_first")
                 ),
@@ -758,27 +758,88 @@ class SyncHandler:
             )
 
             if not enabled_sources:
-                logger.warning(f"没有可用的搜索源，跳过 {mediainfo.title} S{season} 的搜索")
+                logger.warning(
+                    f"没有可用的搜索源，跳过 "
+                    f"{mediainfo.title} S{season} 的搜索"
+                )
                 return transferred_count
+
+            standard_episode_set = set(
+                standard_search_episodes
+            )
+            ayclub_episode_set = set(
+                ayclub_search_episodes
+            )
 
             for source_index, source in enumerate(enabled_sources):
                 if not missing_episodes:
-                    logger.info(f"{mediainfo.title_year} S{season} 所有缺失剧集已转存完成，不再查询后续源")
+                    logger.info(
+                        f"{mediainfo.title_year} S{season} "
+                        f"所有缺失剧集已转存完成，不再查询后续源"
+                    )
                     break
 
                 if transferred_count >= self._max_transfer_per_sync:
-                    logger.info(f"已达单次同步上限 {self._max_transfer_per_sync}，剩余 {len(missing_episodes)} 集将在下次同步处理")
+                    logger.info(
+                        f"已达单次同步上限 "
+                        f"{self._max_transfer_per_sync}，"
+                        f"剩余 {len(missing_episodes)} 集将在下次同步处理"
+                    )
                     break
 
-                logger.info(f"[{source.upper()}] 开始搜索 {mediainfo.title} S{season}（当前缺失: {len(missing_episodes)} 集）")
+                source_episode_set = (
+                    ayclub_episode_set
+                    if source == "ayclub"
+                    else standard_episode_set
+                )
 
-                # 搜索当前源
+                source_episodes = [
+                    episode
+                    for episode in missing_episodes
+                    if episode in source_episode_set
+                ]
+
+                if not source_episodes:
+                    logger.info(
+                        f"[{source.upper()}] 当前没有符合播出门禁的"
+                        f"缺失剧集，跳过该来源"
+                    )
+                    continue
+
+                logger.info(
+                    f"[{source.upper()}] 开始搜索 "
+                    f"{mediainfo.title} S{season}，"
+                    f"目标集数：{source_episodes}"
+                )
+
+                # 暂不把 episodes 传给桥接，以保留整季包搜索结果；
+                # 后续只匹配和转存 source_episodes 中的缺失集。
                 p115_results = self._search_handler.search_single_source(
                     source=source,
                     mediainfo=mediainfo,
                     media_type=MediaType.TV,
-                    season=season
+                    season=season,
                 )
+
+                if (
+                    source == "ayclub"
+                    and tv_gate.get("probe_due")
+                    and mediainfo.tmdb_id
+                ):
+                    ayclub_status = (
+                        self._search_handler.get_ayclub_last_status()
+                    )
+
+                    self._release_gate.mark_tv_probe_result(
+                        tmdb_id=int(mediainfo.tmdb_id),
+                        season=int(season),
+                        search_status=ayclub_status,
+                    )
+
+                    logger.info(
+                        f"{mediainfo.title_year} S{season} "
+                        f"AYCLUB 泄漏探测状态：{ayclub_status}"
+                    )
 
                 if not p115_results:
                     remaining_sources = enabled_sources[source_index + 1:]
