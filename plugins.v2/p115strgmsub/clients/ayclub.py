@@ -75,7 +75,8 @@ class AyclubClient:
 
         last_status 可能值：
         - ok_matched：成功找到有效资源
-        - ok_empty：查询成功，但确实没有匹配资源
+        - ok_empty：本次真实查询成功，但确实没有匹配资源
+        - cached_empty：命中桥接空结果缓存，未重新查询 Telegram
         - invalid_result：接口称已匹配，但没有可用资源项
         - timeout / http_error / error：查询失败
         - disabled / invalid_request：未执行有效查询
@@ -156,11 +157,20 @@ class AyclubClient:
                 )
                 return []
 
+            cached = bool(data.get("cached"))
+
             if not data.get("matched"):
-                self.last_status = "ok_empty"
+                self.last_status = (
+                    "cached_empty"
+                    if cached
+                    else "ok_empty"
+                )
+
                 logger.info(
-                    f"AYCLUB 查询成功但未找到资源：{mediainfo.title} "
-                    f"(TMDB ID: {mediainfo.tmdb_id})"
+                    f"AYCLUB 查询成功但未找到资源："
+                    f"{mediainfo.title} "
+                    f"(TMDB ID: {mediainfo.tmdb_id}, "
+                    f"缓存命中: {cached})"
                 )
                 return []
 
