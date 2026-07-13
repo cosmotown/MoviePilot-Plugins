@@ -931,7 +931,7 @@ class ReleaseGateStore:
         self,
         states: Dict[str, Dict[str, Any]],
     ) -> Dict[str, Dict[str, Any]]:
-        """清理超过 90 天未更新的门禁状态。"""
+        """仅清理超过 90 天未更新且尚未确认发布的状态。"""
         cutoff = self.now() - datetime.timedelta(
             days=self.RETENTION_DAYS
         )
@@ -943,7 +943,11 @@ class ReleaseGateStore:
                 state.get("updated_at")
             )
 
-            if updated_at and updated_at < cutoff:
+            if (
+                not state.get("released")
+                and updated_at
+                and updated_at < cutoff
+            ):
                 logger.info(
                     f"清理过期发布门禁状态：{key}"
                 )
