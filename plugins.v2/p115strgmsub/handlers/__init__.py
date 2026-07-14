@@ -6,10 +6,12 @@ from .search import SearchHandler
 from .sync import SyncHandler
 from .subscribe import SubscribeHandler
 from .api import ApiHandler
+from .lifecycle import LifecycleStore
 
 __all__ = [
     "SearchHandler",
     "SyncHandler",
     "SubscribeHandler",
-    "ApiHandler"
+    "ApiHandler",
+    "LifecycleStore"
 ]

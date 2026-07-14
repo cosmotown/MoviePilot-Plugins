@@ -333,27 +333,117 @@ class FileMatcher:
         return None
 
     @staticmethod
+    def _normalize_movie_text(value: str) -> str:
+        """电影名比较用规范化：保留中英文、数字，忽略空格和标点。"""
+        return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+    @staticmethod
+    def _movie_title_matches(file_name: str, title: str) -> bool:
+        """避免把《片名2/3》误当作不带序号的第一部。"""
+        file_norm = FileMatcher._normalize_movie_text(Path(file_name).stem)
+        title_norm = FileMatcher._normalize_movie_text(title)
+        if not file_norm or not title_norm:
+            return False
+        index = file_norm.find(title_norm)
+        if index < 0:
+            return False
+        suffix = file_norm[index + len(title_norm):]
+        # 命中标题后仍紧跟数字，通常是另一续集编号（如“片名2”误中“片名20”）。
+        if suffix[:1].isdigit():
+            return False
+        return True
+
+    @staticmethod
+    def _movie_quality_rank(file_name: str) -> Tuple[int, int, int, int, int]:
+        """按分辨率、片源、HDR、音轨、编码生成稳定的电影质量排序。"""
+        name = str(file_name or "").lower()
+
+        if re.search(r"(?:2160p|4k|uhd)", name):
+            resolution = 4
+        elif re.search(r"1080[pi]", name):
+            resolution = 3
+        elif re.search(r"720p", name):
+            resolution = 2
+        else:
+            resolution = 1
+
+        if "remux" in name:
+            source = 6
+        elif re.search(r"(?:uhd[ ._-]*blu-?ray|blu-?ray[ ._-]*uhd)", name):
+            source = 5
+        elif re.search(r"blu-?ray|bdrip|bdremux", name):
+            source = 4
+        elif re.search(r"web[ ._-]*dl", name):
+            source = 3
+        elif "webrip" in name:
+            source = 2
+        elif "hdtv" in name:
+            source = 1
+        else:
+            source = 0
+
+        if re.search(r"dolby[ ._-]*vision|\bdv\b", name):
+            hdr = 4
+        elif re.search(r"hdr10\+|hdr10plus", name):
+            hdr = 3
+        elif re.search(r"hdr10|\bhdr\b", name):
+            hdr = 2
+        else:
+            hdr = 0
+
+        if "atmos" in name:
+            audio = 5
+        elif "truehd" in name:
+            audio = 4
+        elif re.search(r"dts[ ._-]*hd[ ._-]*ma|dts-hd", name):
+            audio = 3
+        elif re.search(r"ddp|eac3|dolby[ ._-]*digital[ ._-]*plus", name):
+            audio = 2
+        elif re.search(r"\bdts\b|\bac3\b", name):
+            audio = 1
+        else:
+            audio = 0
+
+        if re.search(r"av1", name):
+            codec = 3
+        elif re.search(r"h[ ._-]*265|hevc|x265", name):
+            codec = 2
+        elif re.search(r"h[ ._-]*264|avc|x264", name):
+            codec = 1
+        else:
+            codec = 0
+
+        return resolution, source, hdr, audio, codec
+
+    @staticmethod
     def match_movie_file(
         files: List[dict],
         title: str,
+        year: int = None,
         min_size_mb: int = 500,
         subscribe_filter: 'SubscribeFilter' = None
     ) -> Optional[dict]:
         """
-        匹配电影文件（查找最大的视频文件）
+        匹配目标电影并在同片多版本中只选择质量最高的一份。
 
         :param files: 文件列表
         :param title: 电影标题
+        :param year: 目标年份；合集分享中用于排除续集/其他影片
         :param min_size_mb: 最小文件大小（MB），用于过滤小文件
         :param subscribe_filter: 订阅过滤条件（质量、分辨率、特效）
-        :return: 匹配的文件信息
+        :return: 唯一最佳匹配文件
         """
-        # 候选列表：(file, filter_score)
-        candidates = []
+        # 候选：(file, filter_score, title_match, quality_rank)
+        raw_candidates = []
         min_size_bytes = min_size_mb * 1024 * 1024
+        target_year = None
+        try:
+            target_year = int(year) if year else None
+        except (TypeError, ValueError):
+            target_year = None
 
         def collect_video_files(file_list: List[dict]):
-            """递归收集所有视频文件"""
+            """递归收集视频文件，但始终只返回具体文件，不转存父目录。"""
             for file in file_list:
                 file_name = file.get("name", "")
                 is_dir = file.get("is_dir", False)
@@ -364,17 +454,34 @@ class FileMatcher:
                         collect_video_files(sub_files)
                     continue
 
-                # 检查文件扩展名
                 ext = Path(file_name).suffix.lower()
                 if ext not in FileMatcher.VIDEO_EXTENSIONS:
                     continue
 
-                # 检查文件大小
-                file_size = file.get("size", 0)
+                file_size = int(file.get("size", 0) or 0)
                 if file_size < min_size_bytes:
                     continue
 
-                # 应用订阅过滤条件
+                years = {
+                    int(value)
+                    for value in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", file_name)
+                }
+                title_match = FileMatcher._movie_title_matches(file_name, title)
+
+                # 文件明确写了其他年份时直接排除；写了目标年份时可作为合集安全匹配。
+                if target_year and years and target_year not in years:
+                    logger.info(
+                        f"电影文件 {file_name} 年份不匹配（目标:{target_year}），跳过"
+                    )
+                    continue
+                if target_year and target_year in years:
+                    identity_match = True
+                else:
+                    identity_match = title_match
+                if not identity_match:
+                    logger.info(f"电影文件 {file_name} 片名/年份不匹配目标 {title}，跳过")
+                    continue
+
                 filter_score = 0
                 if subscribe_filter and subscribe_filter.has_filters():
                     matched, filter_score = subscribe_filter.match(file_name)
@@ -382,16 +489,39 @@ class FileMatcher:
                         logger.info(f"电影文件 {file_name} 不符合订阅过滤条件，跳过")
                         continue
 
-                candidates.append((file, filter_score))
+                raw_candidates.append((
+                    file,
+                    filter_score,
+                    1 if title_match else 0,
+                    FileMatcher._movie_quality_rank(file_name),
+                ))
 
         collect_video_files(files)
 
-        if not candidates:
+        if not raw_candidates:
             return None
 
-        # 优先按 filter_score 降序，其次按文件大小降序
-        candidates.sort(key=lambda x: (x[1], x[0].get("size", 0)), reverse=True)
-        return candidates[0][0]
+        # 订阅过滤分优先；再按画质层级，片名直接匹配仅作为同画质辅助。
+        raw_candidates.sort(
+            key=lambda item: (
+                item[1],
+                item[3],
+                item[2],
+                int(item[0].get("size", 0) or 0),
+            ),
+            reverse=True,
+        )
+        selected = raw_candidates[0][0]
+
+        if len(raw_candidates) > 1:
+            rejected = [item[0].get("name", "") for item in raw_candidates[1:]]
+            logger.info(
+                f"电影同片多版本择优：共 {len(raw_candidates)} 个候选，"
+                f"选择 {selected.get('name', '')}"
+            )
+            logger.info(f"电影同片多版本已跳过：{rejected}")
+
+        return selected
 
     @staticmethod
     def check_existing_episodes(

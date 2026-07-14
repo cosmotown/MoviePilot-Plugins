@@ -4,14 +4,16 @@
 """
 import datetime
 import hashlib
+import re
+
+import pytz
 from typing import List, Dict, Any, Set, Optional, Callable
 
-from app.core.config import global_vars
+from app.core.config import global_vars, settings
 from app.core.metainfo import MetaInfo
 from app.chain.download import DownloadChain
+from app.chain.subscribe import SubscribeChain
 from app.db import SessionFactory
-from app.db.subscribe_oper import SubscribeOper
-from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.log import logger
 from app.schemas import MediaInfo
 from app.schemas.types import MediaType, NotificationType
@@ -21,10 +23,16 @@ from ..utils import FileMatcher, SubscribeFilter
 from .search import SearchHandler
 from .subscribe import SubscribeHandler
 from .release_gate import ReleaseGateStore
+from .lifecycle import LifecycleStore
 
 
 class SyncHandler:
     """同步处理器"""
+
+    AYCLUB_DAILY_REFRESH_DATA_KEY = "ayclub_daily_refresh_state"
+    AYCLUB_REFRESH_WINDOW_START_HOUR = 22
+    AYCLUB_REFRESH_WINDOW_END_HOUR = 24
+    AYCLUB_DAILY_REFRESH_RETENTION_DAYS = 30
 
     def __init__(
         self,
@@ -41,7 +49,8 @@ class SyncHandler:
         notify: bool = False,
         post_message_func: Callable = None,
         get_data_func: Callable = None,
-        save_data_func: Callable = None
+        save_data_func: Callable = None,
+        lifecycle_store: Optional[LifecycleStore] = None
     ):
         """
         初始化同步处理器
@@ -75,10 +84,406 @@ class SyncHandler:
         self._post_message = post_message_func
         self._get_data = get_data_func
         self._save_data = save_data_func
+        self._lifecycle = lifecycle_store or LifecycleStore(
+            get_data_func=get_data_func,
+            save_data_func=save_data_func,
+        )
         self._release_gate = ReleaseGateStore(
             get_data_func=get_data_func,
             save_data_func=save_data_func,
         )
+
+    def invalidate_subscription_caches(
+        self,
+        *,
+        media_type: str,
+        tmdb_id: Optional[int],
+        season: Optional[int] = None,
+    ) -> None:
+        self._release_gate.invalidate_media(
+            media_type=media_type,
+            tmdb_id=tmdb_id,
+            season=season,
+        )
+
+    def _current_cycle_history(
+        self,
+        history: List[dict],
+        subscribe,
+        media_key: str,
+    ) -> List[dict]:
+        generation = self._lifecycle.generation(int(subscribe.id))
+        return [
+            item for item in history or []
+            if int(item.get("subscribe_id") or -1) == int(subscribe.id)
+            and int(item.get("generation") or -1) == generation
+            and item.get("media_key") == media_key
+        ]
+
+    @staticmethod
+    def _extract_missing_episodes(
+        no_exists: Any,
+        mediakey: Any,
+        season: int,
+    ) -> List[int]:
+        if not no_exists or mediakey is None:
+            return []
+        season_map = no_exists.get(mediakey, {}) if isinstance(no_exists, dict) else {}
+        info = season_map.get(season) if isinstance(season_map, dict) else None
+        if not info:
+            return []
+        episodes = list(getattr(info, "episodes", None) or [])
+        if not episodes and getattr(info, "total_episode", None):
+            start = int(getattr(info, "start_episode", None) or 1)
+            episodes = list(range(start, int(info.total_episode) + 1))
+        result = []
+        for episode in episodes:
+            try:
+                number = int(episode)
+            except (TypeError, ValueError):
+                continue
+            if number > 0 and number not in result:
+                result.append(number)
+        return sorted(result)
+
+    @staticmethod
+    def _resource_episode_set(resource: Dict[str, Any]) -> Set[int]:
+        """优先读取桥接结构化集号，并从常见标题格式安全补充。"""
+        result: Set[int] = set()
+        values = resource.get("episodes") or []
+        if not isinstance(values, (list, tuple, set)):
+            values = []
+        for value in values:
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError):
+                pass
+        try:
+            episode = int(resource.get("episode"))
+            if episode > 0:
+                result.add(episode)
+        except (TypeError, ValueError):
+            pass
+        try:
+            start = int(resource.get("episode_start"))
+            end = int(resource.get("episode_end") or start)
+            if 0 < start <= end <= 999:
+                result.update(range(start, end + 1))
+        except (TypeError, ValueError):
+            pass
+
+        title = str(resource.get("title") or "")
+        # S01E01、S01E01-E10、E01、E01-E10、中文“第1集”。
+        for match in re.finditer(
+            r"(?:S\d{1,2})?E(\d{1,3})(?:\s*[-~至—_]\s*E?(\d{1,3}))?",
+            title,
+            flags=re.IGNORECASE,
+        ):
+            try:
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if 0 < start <= end <= 999:
+                    result.update(range(start, end + 1))
+            except (TypeError, ValueError):
+                pass
+        for match in re.finditer(r"第\s*(\d{1,3})\s*集", title):
+            try:
+                result.add(int(match.group(1)))
+            except (TypeError, ValueError):
+                pass
+        return {episode for episode in result if episode > 0}
+
+    def _prefilter_ayclub_results(
+        self,
+        resources: List[Dict[str, Any]],
+        missing_episodes: List[int],
+        season: int,
+    ) -> List[Dict[str, Any]]:
+        """打开115分享前淘汰明确不覆盖当前缺集的 AYCLUB 候选。"""
+        missing = {int(ep) for ep in missing_episodes}
+        kept: List[Dict[str, Any]] = []
+        filtered: List[str] = []
+
+        for resource in resources or []:
+            title = str(resource.get("title") or "")
+            explicit_season = resource.get("season")
+            season_mismatch = False
+            try:
+                if explicit_season is not None:
+                    season_mismatch = int(explicit_season) != int(season)
+            except (TypeError, ValueError):
+                pass
+            if explicit_season is None:
+                title_seasons = {
+                    int(value)
+                    for value in re.findall(r"S(\d{1,2})", title, flags=re.IGNORECASE)
+                }
+                if len(title_seasons) == 1:
+                    season_mismatch = int(season) not in title_seasons
+
+            episodes = self._resource_episode_set(resource)
+            if season_mismatch or (episodes and not (episodes & missing)):
+                filtered.append(title)
+                continue
+            # 集号未知的整季/合集仍保留，稍后打开分享核验真实文件。
+            kept.append(resource)
+
+        if filtered:
+            logger.info(
+                f"AYCLUB候选预过滤：跳过 {len(filtered)} 个明确不覆盖当前缺集的资源，"
+                f"保留 {len(kept)} 个待验证候选"
+            )
+            logger.debug(f"AYCLUB预过滤示例：{filtered[:5]}")
+        return kept
+
+    @staticmethod
+    def _parse_utc_datetime(value: Any) -> Optional[datetime.datetime]:
+        if not value:
+            return None
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _ayclub_daily_refresh_key(tmdb_id: int, season: int) -> str:
+        return f"tv:{int(tmdb_id)}:S{int(season)}"
+
+    @staticmethod
+    def _ayclub_local_timezone():
+        try:
+            return pytz.timezone(settings.TZ)
+        except Exception:
+            logger.warning(
+                f"MoviePilot 时区 {getattr(settings, 'TZ', None)!r} 无效，"
+                "AYCLUB 晚间窗口回退 Asia/Shanghai"
+            )
+            return pytz.timezone("Asia/Shanghai")
+
+    def _ayclub_local_now(self) -> datetime.datetime:
+        return datetime.datetime.now(tz=self._ayclub_local_timezone())
+
+    def _ayclub_in_refresh_window(
+        self,
+        now: Optional[datetime.datetime] = None,
+    ) -> bool:
+        current = now or self._ayclub_local_now()
+        if current.tzinfo is None:
+            current = self._ayclub_local_timezone().localize(current)
+        hour = int(current.hour)
+        return (
+            self.AYCLUB_REFRESH_WINDOW_START_HOUR
+            <= hour
+            < self.AYCLUB_REFRESH_WINDOW_END_HOUR
+        )
+
+    def _load_ayclub_daily_refresh_state(self) -> Dict[str, Dict[str, Any]]:
+        if not self._get_data:
+            return {}
+        try:
+            raw = self._get_data(self.AYCLUB_DAILY_REFRESH_DATA_KEY) or {}
+            if not isinstance(raw, dict):
+                return {}
+            return {
+                str(key): value
+                for key, value in raw.items()
+                if isinstance(value, dict)
+            }
+        except Exception as error:
+            logger.warning(f"读取 AYCLUB 每日真实搜索状态失败：{error}")
+            return {}
+
+    def _save_ayclub_daily_refresh_state(
+        self,
+        states: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not self._save_data:
+            return
+        try:
+            self._save_data(self.AYCLUB_DAILY_REFRESH_DATA_KEY, states)
+        except Exception as error:
+            logger.warning(f"保存 AYCLUB 每日真实搜索状态失败：{error}")
+
+    def _record_ayclub_daily_refresh(
+        self,
+        *,
+        tmdb_id: int,
+        season: int,
+        status: str,
+        reason: str,
+        force_honored: bool = False,
+    ) -> None:
+        local_now = self._ayclub_local_now()
+        utc_now = local_now.astimezone(datetime.timezone.utc)
+        states = self._load_ayclub_daily_refresh_state()
+        retained: Dict[str, Dict[str, Any]] = {}
+
+        for key, value in states.items():
+            checked_at = self._parse_utc_datetime(value.get("checked_at"))
+            if not checked_at:
+                continue
+            age_days = (utc_now - checked_at).total_seconds() / 86400
+            if age_days <= self.AYCLUB_DAILY_REFRESH_RETENTION_DAYS:
+                retained[key] = value
+
+        key = self._ayclub_daily_refresh_key(tmdb_id, season)
+        retained[key] = {
+            "tmdb_id": int(tmdb_id),
+            "season": int(season),
+            "local_date": local_now.date().isoformat(),
+            "checked_at": utc_now.isoformat(),
+            "status": str(status or "unknown"),
+            "reason": str(reason or "unknown"),
+            "force_honored": bool(force_honored),
+        }
+        self._save_ayclub_daily_refresh_state(retained)
+
+    def _ayclub_daily_refresh_due(
+        self,
+        *,
+        tmdb_id: int,
+        season: int,
+        now: Optional[datetime.datetime] = None,
+    ) -> bool:
+        current = now or self._ayclub_local_now()
+        if current.tzinfo is None:
+            current = self._ayclub_local_timezone().localize(current)
+        key = self._ayclub_daily_refresh_key(tmdb_id, season)
+        record = self._load_ayclub_daily_refresh_state().get(key) or {}
+        return str(record.get("local_date") or "") != current.date().isoformat()
+
+    def _ayclub_tv_query_mode(
+        self,
+        *,
+        tmdb_id: Optional[int],
+        season: int,
+        lifecycle_force_refresh: bool,
+    ) -> tuple[bool, bool, str]:
+        """决定本轮 AYCLUB 是真实查询还是严格只读缓存。
+
+        返回：(force_refresh, cache_only, reason)。
+        """
+        if lifecycle_force_refresh:
+            return True, False, "lifecycle_force_refresh"
+
+        now = self._ayclub_local_now()
+        if not tmdb_id:
+            return False, True, "cache_only_missing_tmdb"
+
+        if not self._ayclub_in_refresh_window(now):
+            return False, True, "cache_only_outside_evening_window"
+
+        if not self._ayclub_daily_refresh_due(
+            tmdb_id=int(tmdb_id),
+            season=int(season),
+            now=now,
+        ):
+            return False, True, "cache_only_already_refreshed_today"
+
+        return True, False, "scheduled_evening_refresh"
+
+    def _record_ayclub_query_if_real(
+        self,
+        *,
+        tmdb_id: Optional[int],
+        season: int,
+        reason: str,
+    ) -> bool:
+        if not tmdb_id:
+            return False
+
+        status = self._search_handler.get_ayclub_last_status()
+        cached = self._search_handler.get_ayclub_last_cached()
+        force_honored = self._search_handler.was_ayclub_force_refresh_honored()
+        real_statuses = {"ok_matched", "ok_empty", "invalid_result"}
+        real_query = bool(force_honored or (cached is False and status in real_statuses))
+
+        if real_query:
+            self._record_ayclub_daily_refresh(
+                tmdb_id=int(tmdb_id),
+                season=int(season),
+                status=status,
+                reason=reason,
+                force_honored=force_honored,
+            )
+        return real_query
+
+    def _sort_ayclub_results(
+        self,
+        resources: List[Dict[str, Any]],
+        missing_episodes: List[int],
+        season: int,
+        season_complete: bool,
+        subscribe_filter,
+    ) -> List[Dict[str, Any]]:
+        missing = set(missing_episodes)
+
+        def score(resource: Dict[str, Any]) -> tuple:
+            title = str(resource.get("title") or "")
+            kind = str(resource.get("resource_kind") or "").lower()
+            episodes = self._resource_episode_set(resource)
+            coverage = len(episodes & missing) if episodes else 0
+            explicit_complete = bool(resource.get("is_complete_season"))
+            lower_title = title.lower()
+            title_complete = any(
+                token in lower_title
+                for token in ("complete", "全集", "全季", "完结", "全 ")
+            )
+            season_tokens = {
+                f"s{int(season):02d}".lower(),
+                f"s{int(season)}".lower(),
+                f"第{int(season)}季",
+            }
+            if not kind:
+                if resource.get("episode") is not None:
+                    kind = "single"
+                elif explicit_complete or title_complete:
+                    kind = "season_pack"
+                elif episodes and len(episodes) > 1:
+                    kind = "multi_episode"
+                elif (
+                    any(token in lower_title for token in season_tokens)
+                    and not re.search(r"s\d{1,2}e\d{1,3}", lower_title)
+                ):
+                    kind = "season_pack"
+            season_value = resource.get("season")
+            season_score = 0
+            try:
+                if season_value is not None:
+                    season_score = 40 if int(season_value) == int(season) else -100
+            except (TypeError, ValueError):
+                pass
+            # 桥接明确标记完整整季时始终优先；这是 AYCLUB 的高质量资源。
+            kind_score = 0
+            if explicit_complete:
+                kind_score = 500
+            elif season_complete and kind == "season_pack":
+                kind_score = 400
+            elif kind == "multi_episode":
+                kind_score = 240
+            elif kind == "single":
+                kind_score = 220 if len(missing) <= 2 else 100
+            elif kind == "season_pack":
+                kind_score = 180
+            filter_score = 0
+            try:
+                if subscribe_filter and subscribe_filter.has_filters():
+                    _, filter_score = subscribe_filter.match(title)
+            except Exception:
+                filter_score = 0
+            if title_complete:
+                # 当前桥接尚未返回结构化字段时，也能识别“全集/完结/Complete”。
+                kind_score = max(kind_score, 500)
+            return (
+                season_score + kind_score + coverage * 25 + int(filter_score or 0),
+                coverage,
+                len(episodes),
+            )
+
+        return sorted(resources or [], key=score, reverse=True)
 
     @staticmethod
     def _safe_share_ref(share_url: str) -> str:
@@ -170,35 +575,11 @@ class SyncHandler:
             if hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
 
-            # 检查历史记录是否已成功转存
-            movie_history_score = -1  # -1 表示未转存过
-            movie_perfect_match = False
-            for h in history:
-                if (h.get("title") == subscribe.name
-                        and h.get("type") == "电影"
-                        and h.get("status") == "成功"):
-                    score = h.get("filter_score", 0)
-                    perfect = h.get("perfect_match", False)
-                    if score > movie_history_score:
-                        movie_history_score = score
-                        movie_perfect_match = perfect
-
-            # best_version=1 表示开启洗版（非严格模式）
-            is_best_version = bool(subscribe.best_version)
-
-            if movie_history_score >= 0:
-                if not is_best_version or movie_perfect_match:
-                    logger.info(f"电影 {subscribe.name} 已在历史记录中(洗版:{is_best_version}, 完美匹配:{movie_perfect_match})，跳过")
-                    return transferred_count
-                else:
-                    logger.info(f"电影 {subscribe.name} 洗版中，历史分数 {movie_history_score}，尝试寻找更优资源")
-
-            # 生成元数据
+            # MoviePilot 是媒体与订阅状态真相源。
             meta = MetaInfo(subscribe.name)
             meta.year = subscribe.year
             meta.type = MediaType.MOVIE
 
-            # 识别媒体信息
             mediainfo: MediaInfo = self._chain.recognize_media(
                 meta=meta,
                 mtype=MediaType.MOVIE,
@@ -207,8 +588,63 @@ class SyncHandler:
                 cache=True
             )
             if not mediainfo:
-                logger.warn(f"无法识别媒体信息：{subscribe.name}")
-                return transferred_count            
+                logger.warning(f"无法识别媒体信息：{subscribe.name}")
+                return transferred_count
+
+            media_key = self._lifecycle.media_key_from_subscribe(subscribe)
+            self._lifecycle.ensure_subscription(
+                int(subscribe.id), subscribe, scene="sync"
+            )
+            lifecycle_force_refresh = self._lifecycle.peek_force_refresh(int(subscribe.id))
+
+            mp_subscribe_chain = SubscribeChain()
+            mediakey = subscribe.tmdbid or subscribe.doubanid
+            try:
+                exist_flag, _ = mp_subscribe_chain.resolve_subscribe_missing(
+                    subscribe=subscribe,
+                    meta=meta,
+                    mediainfo=mediainfo,
+                    mediakey=mediakey,
+                )
+            except Exception as error:
+                logger.warning(f"使用 MP 官方接口判断电影缺失失败：{error}")
+                exist_flag = False
+
+            if exist_flag:
+                self._lifecycle.reconcile_missing(
+                    media_key, media_satisfied=True
+                )
+                logger.info(f"MoviePilot 确认电影已满足订阅：{mediainfo.title_year}")
+                try:
+                    mp_subscribe_chain.check_and_handle_existing_media(
+                        subscribe=subscribe,
+                        meta=meta,
+                        mediainfo=mediainfo,
+                        mediakey=mediakey,
+                    )
+                except Exception as error:
+                    logger.warning(f"交由 MP 完成电影订阅失败，将由后续对账恢复：{error}")
+                return transferred_count
+
+            if self._lifecycle.has_pending_movie(media_key):
+                logger.info(
+                    f"电影 {mediainfo.title_year} 已投递并等待 MoviePilot 整理，"
+                    "本次不重复搜索"
+                )
+                return transferred_count
+
+            # 历史只参与当前订阅周期的洗版评分，不再决定媒体是否存在。
+            movie_history_score = -1
+            movie_perfect_match = False
+            is_best_version = bool(subscribe.best_version)
+            if is_best_version:
+                for item in self._current_cycle_history(history, subscribe, media_key):
+                    if item.get("type") != "电影" or item.get("status") != "成功":
+                        continue
+                    score = int(item.get("filter_score") or 0)
+                    if score > movie_history_score:
+                        movie_history_score = score
+                        movie_perfect_match = bool(item.get("perfect_match"))
 
             # 判断本次是否允许查询 AYCLUB。
             # 门禁只控制 AYCLUB，不影响 PanSou、HDHive、Nullbr。
@@ -222,7 +658,9 @@ class SyncHandler:
 
             if mediainfo.tmdb_id:
                 movie_gate = self._release_gate.evaluate_movie(
-                    int(mediainfo.tmdb_id)
+                    int(mediainfo.tmdb_id),
+                    theatrical_date=getattr(mediainfo, "release_date", None),
+                    lifecycle_force_refresh=lifecycle_force_refresh,
                 )
             else:
                 logger.info(
@@ -234,7 +672,10 @@ class SyncHandler:
                 f"电影 {mediainfo.title} AYCLUB 发布门禁："
                 f"允许={movie_gate.get('allow_ayclub')}，"
                 f"优先={movie_gate.get('ayclub_first')}，"
-                f"原因={movie_gate.get('reason')}"
+                f"原因={movie_gate.get('reason')}，"
+                f"模式={'强刷' if movie_gate.get('force_refresh') else ('仅缓存' if movie_gate.get('cache_only') else '禁用')}，"
+                f"间隔={movie_gate.get('interval_days')}天，"
+                f"下次允许={movie_gate.get('next_search_at')}"
             )
 
             # 防止读取到上一个订阅遗留的 AYCLUB 查询状态
@@ -254,6 +695,7 @@ class SyncHandler:
             # 才真正查询下一个来源
             movie_transferred = False
             resource_found = False
+            ayclub_usable_candidate = False
 
             resource_iterator = self._search_handler.iter_resources(
                 mediainfo=mediainfo,
@@ -264,6 +706,8 @@ class SyncHandler:
                 allow_ayclub=bool(
                     movie_gate.get("allow_ayclub")
                 ),
+                force_refresh=bool(movie_gate.get("force_refresh")),
+                cache_only=bool(movie_gate.get("cache_only")),
             )
 
             for resource in resource_iterator:
@@ -271,6 +715,11 @@ class SyncHandler:
 
                 share_url = resource.get("url", "")
                 resource_title = resource.get("title", "")
+                resource_source = str(
+                    resource.get("search_source")
+                    or resource.get("source")
+                    or ""
+                ).lower()
 
                 # 检查是否是刚搜索出尚未真正解锁的延期解锁 HDHive 资源
                 if resource.get("need_unlock") and not share_url:
@@ -314,11 +763,15 @@ class SyncHandler:
 
                     # 匹配电影文件
                     matched_file = FileMatcher.match_movie_file(
-                        share_files, mediainfo.title,
-                        subscribe_filter=subscribe_filter
+                        share_files,
+                        mediainfo.title,
+                        year=mediainfo.year,
+                        subscribe_filter=subscribe_filter,
                     )
 
                     if matched_file:
+                        if resource_source == "ayclub":
+                            ayclub_usable_candidate = True
                         file_name = matched_file.get('name', '')
                         logger.info(f"找到匹配文件：{file_name}")
 
@@ -374,6 +827,11 @@ class SyncHandler:
                             "file_name": file_name,
                             "filter_score": current_score,
                             "perfect_match": is_perfect,
+                            "subscribe_id": int(subscribe.id),
+                            "generation": self._lifecycle.generation(int(subscribe.id)),
+                            "media_key": media_key,
+                            "stage": "pending_organize" if success else "transfer_failed",
+                            "search_source": resource.get("search_source") or resource.get("source"),
                             "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         }
                         history.append(history_item)
@@ -394,43 +852,23 @@ class SyncHandler:
                                 "file_name": file_name
                             })
 
-                            # 添加下载历史记录
-                            try:
-                                DownloadHistoryOper().add(
-                                    path=save_dir,
-                                    type=mediainfo.type.value,
-                                    title=mediainfo.title,
-                                    year=mediainfo.year,
-                                    tmdbid=mediainfo.tmdb_id,
-                                    imdbid=mediainfo.imdb_id,
-                                    tvdbid=mediainfo.tvdb_id,
-                                    doubanid=mediainfo.douban_id,
-                                    image=mediainfo.get_poster_image(),
-                                    downloader="115网盘",
-                                    download_hash=matched_file.get("id"),
-                                    torrent_name=resource_title,
-                                    torrent_description=file_name,
-                                    torrent_site="115网盘",
-                                    username="P115StrgmSub",
-                                    date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    note={
-                                        "source": f"Subscribe|{subscribe.name}",
-                                        "share_ref": share_ref,
-                                    }
-                                )
-                                logger.debug(f"已记录电影 {mediainfo.title} 下载历史")
-                            except Exception as e:
-                                logger.warning(f"记录下载历史失败：{e}")
-
-                            # 电影转存成功后完成订阅
-                            self._subscribe_handler.check_and_finish_subscribe(
+                            # 转存成功只表示已经投递到 MP 整理入口。
+                            # 不写 MoviePilot 下载事实，不直接修改订阅进度或强制完成。
+                            self._lifecycle.add_pending(
                                 subscribe=subscribe,
-                                mediainfo=mediainfo,
-                                success_episodes=[1]
+                                media_key=media_key,
+                                episodes=None,
+                                file_items=[{
+                                    "id": matched_file.get("id"),
+                                    "name": file_name,
+                                }],
+                                share_ref=share_ref,
+                                target_path=save_dir,
+                                source=str(resource.get("search_source") or resource.get("source") or ""),
                             )
-                            # 订阅完成，清除该订阅的历史积分记录
-                            if hasattr(self._search_handler, 'clear_sub_points'):
-                                self._search_handler.clear_sub_points(sub_key)
+                            logger.info(
+                                f"电影 {mediainfo.title_year} 已投递，等待 MoviePilot TransferComplete 入库通知"
+                            )
 
                             # 实际转存成功，立即结束资源迭代，
                             # 避免生成器继续查询后续搜索源
@@ -445,24 +883,34 @@ class SyncHandler:
                     )
                     continue
                     
-            # 未发布电影的泄漏探测，只有 AYCLUB 明确返回
-            # ok_empty 时才会消耗本次机会；超时和报错不消耗。
-            if (
-                movie_gate.get("probe_due")
-                and mediainfo.tmdb_id
-            ):
-                ayclub_status = (
-                    self._search_handler.get_ayclub_last_status()
-                )
+            ayclub_query_status = self._search_handler.get_ayclub_last_status()
+            ayclub_cached = self._search_handler.get_ayclub_last_cached()
+            force_honored = self._search_handler.was_ayclub_force_refresh_honored()
 
-                self._release_gate.mark_movie_probe_result(
+            if lifecycle_force_refresh:
+                if force_honored:
+                    self._lifecycle.clear_force_refresh(int(subscribe.id))
+                    logger.info(
+                        f"订阅 {subscribe.id} 的 AYCLUB 生命周期强刷已确认绕过缓存，"
+                        "清除一次性标记"
+                    )
+                elif ayclub_query_status not in {"idle", "disabled"}:
+                    logger.warning(
+                        f"订阅 {subscribe.id} 已请求 AYCLUB 生命周期强刷，"
+                        "但桥接未确认绕过缓存；保留强刷标记"
+                    )
+
+            if mediainfo.tmdb_id and movie_gate.get("allow_ayclub"):
+                self._release_gate.mark_movie_search_result(
                     tmdb_id=int(mediainfo.tmdb_id),
-                    search_status=ayclub_status,
-                )
-
-                logger.info(
-                    f"电影 {mediainfo.title} AYCLUB 泄漏探测状态："
-                    f"{ayclub_status}"
+                    search_status=ayclub_query_status,
+                    cached=ayclub_cached,
+                    force_honored=force_honored,
+                    usable_candidate=(
+                        ayclub_usable_candidate
+                        if ayclub_query_status == "ok_matched"
+                        else None
+                    ),
                 )
 
             if not resource_found:
@@ -506,18 +954,12 @@ class SyncHandler:
             if hasattr(self._search_handler, 'reset_sub_spent_points'):
                 self._search_handler.reset_sub_spent_points(sub_key)
 
-            # 早期检查：如果订阅显示没有缺失集数，跳过处理
-            if subscribe.lack_episode == 0:
-                logger.info(f"{subscribe.name} S{subscribe.season or 1} 订阅显示媒体库已完整(lack_episode=0)，跳过")
-                return transferred_count
-
-            # 生成元数据
+            # 始终向 MoviePilot 查询当前状态，不能只相信缓存字段 lack_episode。
             meta = MetaInfo(subscribe.name)
             meta.year = subscribe.year
             meta.begin_season = subscribe.season or 1
             meta.type = MediaType.TV
 
-            # 识别媒体信息
             mediainfo: MediaInfo = self._chain.recognize_media(
                 meta=meta,
                 mtype=MediaType.TV,
@@ -525,133 +967,122 @@ class SyncHandler:
                 doubanid=subscribe.doubanid,
                 cache=True
             )
-
             if not mediainfo:
-                logger.warn(f"无法识别媒体信息：{subscribe.name}")
+                logger.warning(f"无法识别媒体信息：{subscribe.name}")
                 return transferred_count
 
-            # 构造总集数信息
-            totals = {}
-            if subscribe.season and subscribe.total_episode:
-                totals = {subscribe.season: subscribe.total_episode}
-
-            # 获取缺失剧集
-            downloadchain = DownloadChain()
-            exist_flag, no_exists = downloadchain.get_no_exists_info(
-                meta=meta,
-                mediainfo=mediainfo,
-                totals=totals
+            season = int(meta.begin_season or 1)
+            mediakey = mediainfo.tmdb_id or mediainfo.douban_id
+            media_key = self._lifecycle.media_key_from_subscribe(subscribe)
+            self._lifecycle.ensure_subscription(
+                int(subscribe.id), subscribe, scene="sync"
             )
+            force_refresh = self._lifecycle.peek_force_refresh(int(subscribe.id))
+
+            mp_subscribe_chain = SubscribeChain()
+            try:
+                exist_flag, no_exists = mp_subscribe_chain.resolve_subscribe_missing(
+                    subscribe=subscribe,
+                    meta=meta,
+                    mediainfo=mediainfo,
+                    mediakey=mediakey,
+                )
+            except Exception as error:
+                # 兼容旧 MP：仍然只调用 MP 自己的 DownloadChain。
+                logger.warning(
+                    f"MP resolve_subscribe_missing 不可用，回退 get_no_exists_info：{error}"
+                )
+                totals = (
+                    {season: subscribe.total_episode}
+                    if subscribe.total_episode
+                    else {}
+                )
+                exist_flag, no_exists = DownloadChain().get_no_exists_info(
+                    meta=meta, mediainfo=mediainfo, totals=totals
+                )
 
             if exist_flag:
-                logger.info(f"{mediainfo.title_year} S{meta.begin_season} 媒体库中已完整存在")
-                # 媒体库已完整，调用完成订阅逻辑
-                total_ep = subscribe.total_episode or 0
-                start_ep = subscribe.start_episode or 1
-                if total_ep > 0:
-                    all_episodes = list(range(start_ep, total_ep + 1))
-                    self._subscribe_handler.check_and_finish_subscribe(
+                self._lifecycle.reconcile_missing(
+                    media_key, media_satisfied=True
+                )
+                logger.info(
+                    f"MoviePilot 确认 {mediainfo.title_year} S{season} 已满足订阅"
+                )
+                try:
+                    mp_subscribe_chain.check_and_handle_existing_media(
                         subscribe=subscribe,
+                        meta=meta,
                         mediainfo=mediainfo,
-                        success_episodes=all_episodes
+                        mediakey=mediakey,
                     )
-                elif subscribe.lack_episode != 0:
-                    SubscribeOper().update(subscribe.id, {"lack_episode": 0})
-                # 订阅已完整，清除历史积分记录
-                if hasattr(self._search_handler, 'clear_sub_points'):
+                except Exception as error:
+                    logger.warning(
+                        f"交由 MP 完成订阅失败，将由后续对账恢复：{error}"
+                    )
+                if hasattr(self._search_handler, "clear_sub_points"):
                     self._search_handler.clear_sub_points(sub_key)
                 return transferred_count
 
-            # 获取缺失的集数列表
-            season = meta.begin_season or 1
-            missing_episodes = []
-            mediakey = mediainfo.tmdb_id or mediainfo.douban_id
-
-            if no_exists and mediakey:
-                season_info = no_exists.get(mediakey, {})
-                not_exist_info = season_info.get(season)
-                if not_exist_info:
-                    missing_episodes = not_exist_info.episodes or []
-                    if not missing_episodes and not_exist_info.total_episode:
-                        start_ep = not_exist_info.start_episode or 1
-                        missing_episodes = list(range(start_ep, not_exist_info.total_episode + 1))
-
-            if not missing_episodes:
-                logger.info(f"{mediainfo.title_year} S{season} 没有缺失剧集信息")
-                return transferred_count
-
-            # 过滤掉小于开始集数的剧集
+            missing_episodes = self._extract_missing_episodes(
+                no_exists=no_exists,
+                mediakey=mediakey,
+                season=season,
+            )
             if subscribe.start_episode:
-                original_count = len(missing_episodes)
-                missing_episodes = [ep for ep in missing_episodes if ep >= subscribe.start_episode]
-                if len(missing_episodes) < original_count:
-                    logger.info(f"根据订阅设置，过滤掉小于 {subscribe.start_episode} 的剧集")
+                missing_episodes = [
+                    episode for episode in missing_episodes
+                    if episode >= int(subscribe.start_episode)
+                ]
 
-            # best_version=1 表示开启洗版
-            is_best_version = bool(subscribe.best_version)
+            mp_missing_episodes = list(missing_episodes)
 
-            # 从历史记录中排除已成功转存的集数
-            transferred_episodes = set()
-            episode_history_scores: Dict[int, int] = {}
-            for h in history:
-                if (h.get("title") == mediainfo.title
-                        and h.get("season") == season
-                        and h.get("status") == "成功"):
-                    ep = h.get("episode")
-                    score = h.get("filter_score", 0)
-                    perfect = h.get("perfect_match", False)
+            # MP 事件是主路径；插件只用在途任务避免整理期间重复投递。
+            pending_episodes = self._lifecycle.pending_episodes(media_key)
+            if pending_episodes:
+                before = set(missing_episodes)
+                missing_episodes = [
+                    episode for episode in missing_episodes
+                    if episode not in pending_episodes
+                ]
+                waiting = sorted(before & pending_episodes)
+                if waiting:
+                    logger.info(
+                        f"{mediainfo.title_year} S{season} {waiting} 已投递并等待 MP 入库，暂不重复搜索"
+                    )
 
-                    if not is_best_version:
-                        transferred_episodes.add(ep)
-                    else:
-                        if perfect:
-                            transferred_episodes.add(ep)
-                        else:
-                            if ep not in episode_history_scores or score > episode_history_scores[ep]:
-                                episode_history_scores[ep] = score
-
-            # 构建转存路径（标题 + 年份，格式如 "权力的游戏 (2011)"）
-            show_folder = f"{mediainfo.title} ({mediainfo.year})" if mediainfo.year else mediainfo.title
-            save_dir = f"{self._save_path}/{show_folder}/Season {season}"
-
-            # 启用七分类时，实际目录要等分享分类后才能确定
-            if self._classifier_client and self._classifier_client.enabled:
-                existing_episodes_in_cloud = set()
-            else:
-                existing_episodes_in_cloud = FileMatcher.check_existing_episodes(
-                    self._p115_manager, mediainfo, season, save_dir
-                )
-
-            # 合并已存在的集数
-            all_existing = transferred_episodes | existing_episodes_in_cloud
-
-            # 洗版模式下，需要升级的集数不应该被排除
-            if is_best_version and episode_history_scores:
-                episodes_to_upgrade = set(episode_history_scores.keys())
-                all_existing = all_existing - episodes_to_upgrade
-                if episodes_to_upgrade:
-                    logger.info(f"{mediainfo.title_year} S{season} 洗版模式：{len(episodes_to_upgrade)} 集待升级")
-
-            if all_existing:
-                missing_episodes = [ep for ep in missing_episodes if ep not in all_existing]
-                logger.info(
-                    f"{mediainfo.title_year} S{season} 跳过已存在的 {len(all_existing)} 集 "
-                    f"(历史记录:{len(transferred_episodes)}, 网盘:{len(existing_episodes_in_cloud)})"
-                )
+            # 事件可能漏失；若 MP 已不再缺某集，补记对应在途任务完成。
+            self._lifecycle.reconcile_missing(
+                media_key, missing_episodes=mp_missing_episodes
+            )
 
             if not missing_episodes:
-                logger.info(f"{mediainfo.title_year} S{season} 所有缺失剧集已存在于网盘")
-                # 网盘中已存在所有缺失集数，更新订阅状态
-                if existing_episodes_in_cloud:
-                    self._subscribe_handler.check_and_finish_subscribe(
-                        subscribe=subscribe,
-                        mediainfo=mediainfo,
-                        success_episodes=list(existing_episodes_in_cloud)
-                    )
-                    # 缺失集数已全部补齐，清除历史积分记录
-                    if hasattr(self._search_handler, 'clear_sub_points'):
-                        self._search_handler.clear_sub_points(sub_key)
+                logger.info(
+                    f"{mediainfo.title_year} S{season} 当前没有需要新投递的剧集"
+                )
                 return transferred_count
+
+            is_best_version = bool(subscribe.best_version)
+            episode_history_scores: Dict[int, int] = {}
+            if is_best_version:
+                for item in self._current_cycle_history(history, subscribe, media_key):
+                    if item.get("type") != "电视剧" or item.get("status") != "成功":
+                        continue
+                    try:
+                        episode = int(item.get("episode"))
+                        score = int(item.get("filter_score") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    episode_history_scores[episode] = max(
+                        score, episode_history_scores.get(episode, -1)
+                    )
+
+            # 七分类目录是 MP 入库投递区，不是最终媒体库；不再扫描它判断长期存在。
+            show_folder = (
+                f"{mediainfo.title} ({mediainfo.year})"
+                if mediainfo.year else mediainfo.title
+            )
+            save_dir = f"{self._save_path}/{show_folder}/Season {season}"
+            existing_episodes_in_cloud: Set[int] = set()
 
             # 根据 TMDB 剧集播出日期决定不同来源可查询的集数。
             # AYCLUB 受发布门禁控制；其他来源仍可查询已播出或日期未知的缺失集。
@@ -668,6 +1099,7 @@ class SyncHandler:
                 "aired_episodes": [],
                 "future_episodes": [],
                 "unknown_episodes": [],
+                "aired_episode_frontier": None,
                 "ayclub_episodes": [],
             }
 
@@ -724,8 +1156,9 @@ class SyncHandler:
                     f"本次不查询 AYCLUB"
                 )
 
-            # 普通来源不搜索有明确未来播出日期的集数；
-            # 日期未知的集数保持原有行为，可以继续查询。
+            # 普通来源只查询已经播出到的集数。
+            # TMDB经常只为已播集填写air_date，
+            # 使用整季已播前沿避免搜索日期未知的未来集。
             standard_search_episodes = list(
                 all_missing_episodes
             )
@@ -735,11 +1168,33 @@ class SyncHandler:
                     tv_gate.get("future_episodes") or []
                 )
 
-                standard_search_episodes = [
-                    episode
-                    for episode in all_missing_episodes
-                    if episode not in future_episode_set
-                ]
+                try:
+                    aired_episode_frontier = int(
+                        tv_gate.get(
+                            "aired_episode_frontier"
+                        ) or 0
+                    )
+                except (TypeError, ValueError):
+                    aired_episode_frontier = 0
+
+                if aired_episode_frontier > 0:
+                    standard_search_episodes = [
+                        episode
+                        for episode in all_missing_episodes
+                        if (
+                            episode
+                            <= aired_episode_frontier
+                            and episode
+                            not in future_episode_set
+                        )
+                    ]
+                else:
+                    standard_search_episodes = [
+                        episode
+                        for episode in all_missing_episodes
+                        if episode
+                        not in future_episode_set
+                    ]
 
             ayclub_search_episodes = [
                 episode
@@ -778,6 +1233,11 @@ class SyncHandler:
 
             # 成功转存的集数列表
             success_episodes = []
+
+            # 同一部剧同一季度只需成功分类一次；
+            # 后续分享复用分类目录。
+            classified_target_root: Optional[str] = None
+            classified_save_dir: Optional[str] = None
 
             # 智能回退搜索：按源迭代
             enabled_sources = self._search_handler.get_enabled_sources(
@@ -844,6 +1304,31 @@ class SyncHandler:
                     f"目标集数：{source_episodes}"
                 )
 
+                ayclub_force_refresh = False
+                ayclub_cache_only = False
+                ayclub_query_reason = "not_ayclub"
+
+                if source == "ayclub":
+                    (
+                        ayclub_force_refresh,
+                        ayclub_cache_only,
+                        ayclub_query_reason,
+                    ) = self._ayclub_tv_query_mode(
+                        tmdb_id=getattr(mediainfo, "tmdb_id", None),
+                        season=int(season),
+                        lifecycle_force_refresh=force_refresh,
+                    )
+                    if ayclub_force_refresh:
+                        logger.info(
+                            f"{mediainfo.title_year} S{season} AYCLUB 查询模式："
+                            f"真实搜索，原因={ayclub_query_reason}"
+                        )
+                    else:
+                        logger.info(
+                            f"{mediainfo.title_year} S{season} AYCLUB 查询模式："
+                            f"仅缓存，原因={ayclub_query_reason}"
+                        )
+
                 # 暂不把 episodes 传给桥接，以保留整季包搜索结果；
                 # 后续只匹配和转存 source_episodes 中的缺失集。
                 p115_results = self._search_handler.search_single_source(
@@ -851,7 +1336,34 @@ class SyncHandler:
                     mediainfo=mediainfo,
                     media_type=MediaType.TV,
                     season=season,
+                    force_refresh=ayclub_force_refresh,
+                    cache_only=ayclub_cache_only,
                 )
+
+                if source == "ayclub":
+                    real_query = self._record_ayclub_query_if_real(
+                        tmdb_id=getattr(mediainfo, "tmdb_id", None),
+                        season=int(season),
+                        reason=ayclub_query_reason,
+                    )
+                    if real_query:
+                        logger.info(
+                            f"{mediainfo.title_year} S{season} AYCLUB 今日真实搜索已记录"
+                        )
+
+                if source == "ayclub" and force_refresh:
+                    ayclub_query_status = self._search_handler.get_ayclub_last_status()
+                    force_honored = self._search_handler.was_ayclub_force_refresh_honored()
+                    if force_honored:
+                        self._lifecycle.clear_force_refresh(int(subscribe.id))
+                        logger.info(
+                            f"订阅 {subscribe.id} 的 AYCLUB 强制刷新已确认绕过缓存，清除一次性标记"
+                        )
+                    elif ayclub_query_status not in {"idle", "disabled"}:
+                        logger.warning(
+                            f"订阅 {subscribe.id} 已请求 AYCLUB 强制刷新，但桥接未确认绕过缓存；"
+                            "保留强刷标记，待桥接升级或后续真实刷新"
+                        )
 
                 if (
                     source == "ayclub"
@@ -873,13 +1385,45 @@ class SyncHandler:
                         f"AYCLUB 泄漏探测状态：{ayclub_status}"
                     )
 
+                if source == "ayclub":
+                    p115_results = self._prefilter_ayclub_results(
+                        resources=p115_results,
+                        missing_episodes=source_episodes,
+                        season=season,
+                    )
+
                 if not p115_results:
+                    if source == "ayclub":
+                        logger.info("AYCLUB候选均与当前缺集无交集，不再打开115分享")
                     remaining_sources = enabled_sources[source_index + 1:]
                     if remaining_sources:
                         logger.info(f"[{source.upper()}] 未找到资源，将尝试下一个源: {remaining_sources[0].upper()}")
                     else:
                         logger.info(f"[{source.upper()}] 未找到资源，已无更多可用源")
                     continue
+
+                if source == "ayclub":
+                    try:
+                        aired_frontier = int(tv_gate.get("aired_episode_frontier") or 0)
+                    except (TypeError, ValueError):
+                        aired_frontier = 0
+                    total_episode = int(subscribe.total_episode or 0)
+                    season_complete = bool(
+                        total_episode > 0
+                        and aired_frontier >= total_episode
+                        and not (tv_gate.get("future_episodes") or [])
+                    )
+                    p115_results = self._sort_ayclub_results(
+                        resources=p115_results,
+                        missing_episodes=source_episodes,
+                        season=season,
+                        season_complete=season_complete,
+                        subscribe_filter=subscribe_filter,
+                    )
+                    logger.info(
+                        f"AYCLUB候选已按完整整季/覆盖集数/质量排序，"
+                        f"季度完结={season_complete}"
+                    )
 
                 logger.info(f"[{source.upper()}] 找到 {len(p115_results)} 个 115 网盘资源")
 
@@ -938,14 +1482,35 @@ class SyncHandler:
 
                         logger.info(f"分享包含 {len(share_files)} 个文件/目录")
 
-                        # 收集该分享中所有匹配的文件
+                        # 收集该分享中所有匹配的文件。
+                        # AYCLUB单集结果只核对对应集；
+                        # 整季包及其他来源仍匹配全部当前缺失集。
                         matched_items = []
-
-                        for episode in [
+                        candidate_episodes = [
                             episode
                             for episode in source_episodes
                             if episode in missing_episodes
-                        ]:
+                        ]
+
+                        if source == "ayclub":
+                            resource_season = resource.get("season")
+                            try:
+                                if resource_season is not None and int(resource_season) != int(season):
+                                    logger.info(
+                                        f"AYCLUB候选季号不匹配：资源S{resource_season}，目标S{season}"
+                                    )
+                                    continue
+                            except (TypeError, ValueError):
+                                pass
+
+                            resource_episodes = self._resource_episode_set(resource)
+                            if resource_episodes:
+                                candidate_episodes = [
+                                    episode for episode in candidate_episodes
+                                    if episode in resource_episodes
+                                ]
+
+                        for episode in candidate_episodes:
                             matched_file = FileMatcher.match_episode_file(
                                 share_files,
                                 mediainfo.title,
@@ -983,64 +1548,65 @@ class SyncHandler:
                             logger.info(f"该分享未匹配到 S{season} 的任何缺失剧集，可能是季数不匹配或文件名无法识别")
                             continue
 
-                        # 调用 OpenClaw 七分类服务确定剧集目标根目录
-                        target_root = self._resolve_target_root(
-                            share_url=share_url,
-                            media_type="tv",
-                            title=mediainfo.title,
-                            fallback_root=self._save_path,
-                            year=mediainfo.year,
-                            tmdb_id=mediainfo.tmdb_id,
-                            season=season,
-                            resource_title=resource_title,
-                            file_names=[
-                                item["file"].get("name", "")
-                                for item in matched_items
-                            ],
-                        )
-                        if not target_root:
-                            continue
-
-                        # 分类根目录下保留标题、年份和季度目录
-                        save_dir = (
-                            f"{target_root.rstrip('/')}/"
-                            f"{show_folder}/Season {season}"
-                        )
-                        logger.info(f"剧集分类后的转存目标路径: {save_dir}")
-
-                        # 检查分类后的真实目录中是否已有剧集
-                        classified_existing = FileMatcher.check_existing_episodes(
-                            self._p115_manager,
-                            mediainfo,
-                            season,
-                            save_dir,
-                        )
-
-                        if classified_existing:
-                            existing_episodes_in_cloud |= classified_existing
-
-                            # 洗版模式下，需要升级的剧集不能因文件已存在而跳过
-                            skip_existing = set(classified_existing)
-                            if is_best_version and episode_history_scores:
-                                skip_existing -= set(episode_history_scores.keys())
-
-                            if skip_existing:
-                                matched_items = [
-                                    item
-                                    for item in matched_items
-                                    if item["episode"] not in skip_existing
-                                ]
-                                missing_episodes = [
-                                    episode
-                                    for episode in missing_episodes
-                                    if episode not in skip_existing
-                                ]
-                                logger.info(
-                                    f"分类目录中已存在 {len(skip_existing)} 集，已跳过"
+                        # 同一TMDB和季度只在首次有效分享时
+                        # 调用一次OpenClaw，避免单集间分类波动。
+                        if classified_target_root is None:
+                            target_root = (
+                                self._resolve_target_root(
+                                    share_url=share_url,
+                                    media_type="tv",
+                                    title=mediainfo.title,
+                                    fallback_root=(
+                                        self._save_path
+                                    ),
+                                    year=mediainfo.year,
+                                    tmdb_id=(
+                                        mediainfo.tmdb_id
+                                    ),
+                                    season=season,
+                                    resource_title=(
+                                        resource_title
+                                    ),
+                                    file_names=[
+                                        item["file"].get(
+                                            "name", ""
+                                        )
+                                        for item in matched_items
+                                    ],
                                 )
+                            )
+                            if not target_root:
+                                continue
 
-                                if not matched_items:
-                                    continue
+                            classified_target_root = (
+                                target_root
+                            )
+                            classified_save_dir = (
+                                f"{target_root.rstrip('/')}/"
+                                f"{show_folder}/"
+                                f"Season {season}"
+                            )
+                            logger.info(
+                                "剧集分类后的转存目标路径: "
+                                f"{classified_save_dir}"
+                            )
+                        else:
+                            logger.debug(
+                                "复用剧集分类目录："
+                                f"{classified_save_dir}"
+                            )
+
+                        save_dir = (
+                            classified_save_dir
+                            or (
+                                f"{classified_target_root.rstrip('/')}/"
+                                f"{show_folder}/"
+                                f"Season {season}"
+                            )
+                        )
+
+                        # 七分类目录只是 MoviePilot 入库投递区。
+                        # 不在这里判断长期已存在；防重复由 MP 缺失状态和 pending 任务负责。
 
                         # 检查转存配额限制
                         remaining_quota = self._max_transfer_per_sync - transferred_count
@@ -1082,6 +1648,11 @@ class SyncHandler:
                                 "file_name": file_name,
                                 "filter_score": current_score,
                                 "perfect_match": is_perfect,
+                                "subscribe_id": int(subscribe.id),
+                                "generation": self._lifecycle.generation(int(subscribe.id)),
+                                "media_key": media_key,
+                                "stage": "pending_organize" if success else "transfer_failed",
+                                "search_source": resource.get("search_source") or resource.get("source"),
                                 "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             }
                             history.append(history_item)
@@ -1122,36 +1693,25 @@ class SyncHandler:
                             else:
                                 logger.error(f"转存失败：{mediainfo.title} S{season:02d}E{episode:02d}")
 
-                        # 记录下载历史
+                        # 转存成功仅记录在途任务，等待 MP TransferComplete。
                         if batch_success_episodes:
-                            try:
-                                episodes_str = StringUtils.format_ep(batch_success_episodes)
-                                DownloadHistoryOper().add(
-                                    path=save_dir,
-                                    type=mediainfo.type.value,
-                                    title=mediainfo.title,
-                                    year=mediainfo.year,
-                                    tmdbid=mediainfo.tmdb_id,
-                                    imdbid=mediainfo.imdb_id,
-                                    tvdbid=mediainfo.tvdb_id,
-                                    doubanid=mediainfo.douban_id,
-                                    seasons=f"S{season:02d}",
-                                    episodes=episodes_str,
-                                    image=mediainfo.get_poster_image(),
-                                    downloader="115网盘",
-                                    download_hash=share_ref,
-                                    torrent_name=resource_title,
-                                    torrent_site="115网盘",
-                                    username="P115StrgmSub",
-                                    date=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                    note={
-                                        "source": f"Subscribe|{subscribe.name}",
-                                        "share_ref": share_ref,
-                                    }
-                                )
-                                logger.debug(f"已记录 {mediainfo.title} S{season:02d} {episodes_str} 下载历史")
-                            except Exception as e:
-                                logger.warning(f"记录下载历史失败：{e}")
+                            success_items = [
+                                item for item in matched_items
+                                if item["file"]["id"] in success_id_set
+                            ]
+                            self._lifecycle.add_pending(
+                                subscribe=subscribe,
+                                media_key=media_key,
+                                episodes=batch_success_episodes,
+                                file_items=success_items,
+                                share_ref=share_ref,
+                                target_path=save_dir,
+                                source=str(resource.get("search_source") or resource.get("source") or source),
+                            )
+                            logger.info(
+                                f"{mediainfo.title_year} S{season} "
+                                f"{sorted(batch_success_episodes)} 已投递，等待 MoviePilot 入库通知"
+                            )
 
                         if not missing_episodes:
                             break
@@ -1171,24 +1731,8 @@ class SyncHandler:
                     else:
                         logger.info(f"[{source.upper()}] 处理完成，仍有 {len(missing_episodes)} 集缺失，已无更多可用源")
 
-            # 更新订阅状态
-            # 将网盘已存在的集数和本次成功转存的集数合并
-            all_success_episodes = list(set(success_episodes) | existing_episodes_in_cloud)
-            if all_success_episodes:
-                self._subscribe_handler.check_and_finish_subscribe(
-                    subscribe=subscribe,
-                    mediainfo=mediainfo,
-                    success_episodes=all_success_episodes
-                )
-                # 如果订阅已完成（缺失集数归零），清除该订阅的历史积分记录
-                total_ep = subscribe.total_episode or 0
-                start_ep = subscribe.start_episode or 1
-                if total_ep > 0:
-                    expected = set(range(start_ep, total_ep + 1))
-                    downloaded = set(subscribe.note or []).union(set(all_success_episodes))
-                    if not (expected - downloaded):
-                        if hasattr(self._search_handler, 'clear_sub_points'):
-                            self._search_handler.clear_sub_points(sub_key)
+            # 不直接写 note/lack_episode，也不强制完成订阅。
+            # MP 的 TransferComplete、订阅刷新与 SubscribeComplete 负责最终状态。
 
         except Exception as e:
             logger.error(f"处理订阅 {subscribe.name} 出错：{str(e)}")
@@ -1234,6 +1778,10 @@ class SyncHandler:
 
         self._post_message(
             mtype=NotificationType.Plugin,
-            title=f"【115网盘订阅追更】转存完成",
-            text=f"本次共转存 {total_count} 个文件\n\n" + "\n".join(text_lines)
+            title=f"【115网盘订阅追更】已投递等待入库",
+            text=(
+                f"本次共向 MoviePilot 入库目录投递 {total_count} 个文件，"
+                f"最终完成状态以 MoviePilot 入库通知为准。\n\n"
+                + "\n".join(text_lines)
+            )
         )

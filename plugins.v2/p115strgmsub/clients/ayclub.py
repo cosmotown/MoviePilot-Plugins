@@ -1,7 +1,7 @@
 """
 AYCLUB Telegram 影视机器人桥接客户端。
 
-通过本机 tg-ayclub-bridge 服务查询 @ayclub_bot，
+通过本机 Telegram 桥接服务查询已配置的影视机器人，
 按 TMDB、年份、标题、季集信息返回 115cdn 分享链接。
 """
 
@@ -32,7 +32,15 @@ class AyclubClient:
         # 最近一次查询状态，供发布门禁判断是否消耗探测次数
         self.last_status: str = "idle"
         self.last_error: str = ""
-        
+        self.last_cached: Optional[bool] = None
+        self.last_cache_age_seconds: Optional[int] = None
+        self.last_force_refresh_requested: bool = False
+        self.last_force_refresh_honored: bool = False
+        self.last_force_refresh_supported: Optional[bool] = None
+        self.last_cache_only_requested: bool = False
+        self.last_cache_only_honored: bool = False
+        self.last_cache_only_supported: Optional[bool] = None
+
         self._session = requests.Session()
 
         # 本机服务禁止继承 MoviePilot / 系统代理，
@@ -95,12 +103,44 @@ class AyclubClient:
             logger.warning(f"AYCLUB 桥接健康检查失败：{error}")
             return False
         
+    def invalidate_cache(
+        self,
+        *,
+        tmdb_id: Optional[int],
+        media_type: str,
+        season: Optional[int] = None,
+    ) -> bool:
+        """尽力通知桥接清除指定媒体缓存；旧桥接不支持时安全降级。"""
+        if not self.is_ready or not tmdb_id:
+            return False
+        try:
+            response = self._session.post(
+                f"{self.base_url}/cache/invalidate",
+                json={
+                    "tmdb_id": int(tmdb_id),
+                    "media_type": str(media_type),
+                    "season": int(season) if season is not None else None,
+                },
+                timeout=min(self.timeout, 15),
+            )
+            if response.status_code in (404, 405):
+                logger.info("当前 AYCLUB 桥接暂不支持定向清缓存，将在下次查询携带 force_refresh")
+                return False
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+            return bool(data.get("ok", True))
+        except Exception as error:
+            logger.warning(f"通知 AYCLUB 桥接清缓存失败：{error}")
+            return False
+
     def search(
         self,
         mediainfo: MediaInfo,
         media_type: MediaType,
         season: Optional[int] = None,
         episodes: Optional[List[int]] = None,
+        force_refresh: bool = False,
+        cache_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         查询 AYCLUB 机器人资源。
@@ -115,6 +155,14 @@ class AyclubClient:
         """
         self.last_status = "attempted"
         self.last_error = ""
+        self.last_cached = None
+        self.last_cache_age_seconds = None
+        self.last_force_refresh_requested = bool(force_refresh)
+        self.last_force_refresh_honored = False
+        self.last_force_refresh_supported = None
+        self.last_cache_only_requested = bool(cache_only)
+        self.last_cache_only_honored = False
+        self.last_cache_only_supported = None
 
         if not self.is_ready:
             self.last_status = "disabled"
@@ -155,6 +203,8 @@ class AyclubClient:
             ),
             "episodes": sorted(episode_numbers),
             "max_pages": self.max_pages,
+            "force_refresh": bool(force_refresh),
+            "cache_only": bool(cache_only),
         }
 
         try:
@@ -163,14 +213,42 @@ class AyclubClient:
                 f"(TMDB ID: {mediainfo.tmdb_id}, "
                 f"类型: {payload['media_type']}, "
                 f"季: {season}, "
-                f"集: {payload['episodes']})"
+                f"集: {payload['episodes']}, "
+                f"强刷: {payload['force_refresh']}, "
+                f"仅缓存: {payload['cache_only']})"
             )
 
+            fallback_used = False
             response = self._session.post(
                 f"{self.base_url}/search",
                 json=payload,
                 timeout=self.timeout,
             )
+            if response.status_code == 422 and cache_only:
+                # cache_only 的安全目标是绝不访问 Telegram。旧桥接不支持时不能
+                # 回退旧协议，否则会把白天缓存检查变成真实搜索。
+                self.last_cache_only_supported = False
+                self.last_status = "cache_only_unsupported"
+                self.last_error = "桥接不支持 cache_only，已安全停止 AYCLUB 查询"
+                logger.error(
+                    "AYCLUB桥接不支持cache_only字段；为避免非晚间真实访问 Telegram，"
+                    "本次不回退旧协议，请先升级桥接至 1.4.2"
+                )
+                return []
+
+            if response.status_code == 422 and force_refresh:
+                # 旧桥接请求模型可能不认识 force_refresh，自动回退旧协议。
+                fallback_used = True
+                self.last_force_refresh_supported = False
+                legacy_payload = dict(payload)
+                legacy_payload.pop("force_refresh", None)
+                legacy_payload.pop("cache_only", None)
+                logger.warning("AYCLUB桥接不支持force_refresh字段，已回退旧协议；本次不能保证绕过缓存")
+                response = self._session.post(
+                    f"{self.base_url}/search",
+                    json=legacy_payload,
+                    timeout=self.timeout,
+                )
             response.raise_for_status()
 
             data = response.json()
@@ -189,20 +267,55 @@ class AyclubClient:
                 )
                 return []
 
+            cached_present = "cached" in data
             cached = bool(data.get("cached"))
+            self.last_cached = cached if cached_present else None
+            try:
+                cache_age = data.get("cache_age_seconds", data.get("cache_age"))
+                self.last_cache_age_seconds = int(cache_age) if cache_age is not None else None
+            except (TypeError, ValueError):
+                self.last_cache_age_seconds = None
+
+            if force_refresh:
+                explicit_honored = data.get("force_refresh_honored")
+                if explicit_honored is not None:
+                    self.last_force_refresh_honored = bool(explicit_honored)
+                    self.last_force_refresh_supported = True
+                elif not fallback_used and cached_present:
+                    self.last_force_refresh_supported = True
+                    self.last_force_refresh_honored = not cached
+                else:
+                    self.last_force_refresh_honored = False
+
+            if cache_only:
+                explicit_cache_only = data.get("cache_only_honored")
+                if explicit_cache_only is not None:
+                    self.last_cache_only_honored = bool(explicit_cache_only)
+                    self.last_cache_only_supported = True
+                else:
+                    self.last_cache_only_honored = False
+                    self.last_cache_only_supported = False
+
+            bridge_status = str(data.get("status") or "")
 
             if not data.get("matched"):
-                self.last_status = (
-                    "cached_empty"
-                    if cached
-                    else "ok_empty"
-                )
+                if bridge_status == "cache_miss":
+                    self.last_status = "cache_miss"
+                else:
+                    self.last_status = (
+                        "cached_empty"
+                        if cached
+                        else "ok_empty"
+                    )
 
                 logger.info(
                     f"AYCLUB 查询成功但未找到资源："
                     f"{mediainfo.title} "
                     f"(TMDB ID: {mediainfo.tmdb_id}, "
-                    f"缓存命中: {cached})"
+                    f"缓存命中: {self.last_cached}, "
+                    f"缓存年龄: {self.last_cache_age_seconds}, "
+                    f"强刷生效: {self.last_force_refresh_honored}, "
+                    f"仅缓存生效: {self.last_cache_only_honored})"
                 )
                 return []
 
@@ -230,6 +343,15 @@ class AyclubClient:
                     "year": item.get("year"),
                     "season": item.get("season"),
                     "episode": item.get("episode"),
+                    "episodes": item.get("episodes"),
+                    "resource_kind": item.get("resource_kind"),
+                    "is_complete_season": item.get("is_complete_season"),
+                    "episode_start": item.get("episode_start"),
+                    "episode_end": item.get("episode_end"),
+                    "resolution": item.get("resolution"),
+                    "quality": item.get("quality"),
+                    "codec": item.get("codec"),
+                    "hdr": item.get("hdr"),
                     "title_match": item.get("title_match"),
                     "year_match": item.get("year_match"),
                 })
@@ -247,7 +369,13 @@ class AyclubClient:
                 f"AYCLUB 找到 {len(results)} 个精确匹配的 "
                 f"115cdn 资源，扫描页数："
                 f"{data.get('pages_scanned', 0)}，"
-                f"状态：{self.last_status}"
+                f"状态：{self.last_status}，"
+                f"缓存命中：{self.last_cached}，"
+                f"缓存年龄：{self.last_cache_age_seconds}秒，"
+                f"强刷请求：{self.last_force_refresh_requested}，"
+                f"强刷生效：{self.last_force_refresh_honored}，"
+                f"仅缓存请求：{self.last_cache_only_requested}，"
+                f"仅缓存生效：{self.last_cache_only_honored}"
             )
 
             return results

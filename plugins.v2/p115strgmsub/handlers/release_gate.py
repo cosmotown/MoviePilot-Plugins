@@ -19,7 +19,7 @@ class ReleaseGateStore:
     """发布门禁状态持久化管理器。"""
 
     DATA_KEY = "release_gate_state"
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     RETENTION_DAYS = 90
 
     def __init__(
@@ -131,13 +131,50 @@ class ReleaseGateStore:
             "provider_countries": [],
             "provider_names": [],
             "next_known_release_date": None,
+            "aired_episode_frontier": None,
             "last_tmdb_check_date": None,
             "last_tmdb_check_status": None,
             "leak_probe_done": False,
             "last_leak_probe_at": None,
             "next_leak_probe_at": None,
+            # 电影真实 AYCLUB 搜索节流状态（schema v2）
+            "digital_release_date": None,
+            "other_release_date": None,
+            "theatrical_release_date": None,
+            "movie_empty_count": 0,
+            "last_movie_real_search_at": None,
+            "next_movie_real_search_at": None,
+            "last_movie_search_status": None,
+            "last_movie_search_interval_days": None,
             "updated_at": None,
         }
+
+
+    def invalidate_media(
+        self,
+        media_type: str,
+        tmdb_id: Optional[int],
+        season: Optional[int] = None,
+    ) -> bool:
+        """在 MP 重置订阅时清除对应媒体的发布门禁缓存。"""
+        if not tmdb_id:
+            return False
+        try:
+            key = (
+                self.tv_key(int(tmdb_id), int(season or 1))
+                if str(media_type).lower() in {"tv", "电视剧"}
+                else self.movie_key(int(tmdb_id))
+            )
+            states = self._load_all()
+            existed = key in states
+            if existed:
+                states.pop(key, None)
+                self._save_all(states)
+                logger.info(f"已清除 AYCLUB 发布门禁缓存：{key}")
+            return existed
+        except Exception as error:
+            logger.warning(f"清除发布门禁缓存失败：{error}")
+            return False
 
     def get_movie(
         self,
@@ -269,51 +306,47 @@ class ReleaseGateStore:
     def _analyze_release_dates(
         self,
         release_regions: List[Dict[str, Any]],
-    ) -> Tuple[Optional[str], Optional[str]]:
+    ) -> Tuple[
+        Optional[str],
+        Optional[str],
+        Optional[str],
+        Optional[str],
+    ]:
         """
         分析电影发行日期。
 
-        TMDB 类型：
-        4 = Digital
-        5 = Physical
-        6 = TV
+        TMDB 类型：4=Digital、5=Physical、6=TV。
+        返回：发布信号、下一已知发行日、最早数字发行日、最早实体/电视发行日。
         """
         today = self.today()
         valid_types = {4, 5, 6}
-        type_priority = {
-            4: 0,
-            5: 1,
-            6: 2,
-        }
-
+        type_priority = {4: 0, 5: 1, 6: 2}
         released_candidates = []
         future_dates = []
+        digital_dates = []
+        other_dates = []
 
         for region in release_regions:
             if not isinstance(region, dict):
                 continue
-
-            country = str(
-                region.get("iso_3166_1") or ""
-            )
-
+            country = str(region.get("iso_3166_1") or "")
             for release in region.get("release_dates") or []:
                 if not isinstance(release, dict):
                     continue
-
                 try:
                     release_type = int(release.get("type"))
                 except (TypeError, ValueError):
                     continue
-
                 if release_type not in valid_types:
                     continue
-
-                release_date = self._parse_tmdb_date(
-                    release.get("release_date")
-                )
+                release_date = self._parse_tmdb_date(release.get("release_date"))
                 if not release_date:
                     continue
+
+                if release_type == 4:
+                    digital_dates.append(release_date)
+                else:
+                    other_dates.append(release_date)
 
                 if release_date <= today:
                     released_candidates.append((
@@ -326,33 +359,88 @@ class ReleaseGateStore:
                     future_dates.append(release_date)
 
         release_signal = None
-
         if released_candidates:
             released_candidates.sort(
-                key=lambda item: (
-                    item[0],
-                    item[1],
-                    item[3],
-                )
+                key=lambda item: (item[0], item[1], item[3])
             )
-
-            _, signal_date, release_type, country = (
-                released_candidates[0]
-            )
-
+            _, signal_date, release_type, country = released_candidates[0]
             release_signal = (
                 f"release_type_{release_type}:"
-                f"{country or 'unknown'}:"
-                f"{signal_date.isoformat()}"
+                f"{country or 'unknown'}:{signal_date.isoformat()}"
             )
 
-        next_release_date = (
-            min(future_dates).isoformat()
-            if future_dates
-            else None
+        return (
+            release_signal,
+            min(future_dates).isoformat() if future_dates else None,
+            min(digital_dates).isoformat() if digital_dates else None,
+            min(other_dates).isoformat() if other_dates else None,
         )
 
-        return release_signal, next_release_date
+    @staticmethod
+    def _movie_empty_backoff_floor_days(empty_count: int) -> int:
+        """连续无结果退避：第2次至少3天、第3次7天、第4次起14天。"""
+        try:
+            count = max(0, int(empty_count or 0))
+        except (TypeError, ValueError):
+            count = 0
+        if count >= 4:
+            return 14
+        if count == 3:
+            return 7
+        if count == 2:
+            return 3
+        return 0
+
+    def _movie_base_interval_days(self, state: Dict[str, Any]) -> int:
+        """按数字发行日优先、影院上映日兜底计算电影基础搜索间隔。"""
+        today = self.today()
+        digital_date = self._parse_tmdb_date(state.get("digital_release_date"))
+        if digital_date and digital_date <= today:
+            age = (today - digital_date).days
+            if age <= 7:
+                return 1
+            if age <= 30:
+                return 2
+            if age <= 90:
+                return 4
+            if age <= 365:
+                return 7
+            return 14
+
+        theatrical_date = self._parse_tmdb_date(
+            state.get("theatrical_release_date")
+        )
+        if not theatrical_date:
+            return 14
+        age = (today - theatrical_date).days
+        if age < 30:
+            return 14
+        if age <= 90:
+            return 7
+        return 14
+
+    def _movie_search_interval_days(self, state: Dict[str, Any]) -> int:
+        base = self._movie_base_interval_days(state)
+        floor = self._movie_empty_backoff_floor_days(
+            state.get("movie_empty_count") or 0
+        )
+        return max(base, floor)
+
+    def _movie_real_search_due(self, state: Dict[str, Any]) -> bool:
+        last_search = self._parse_datetime(
+            state.get("last_movie_real_search_at")
+        )
+        if not last_search:
+            return True
+        interval_days = self._movie_search_interval_days(state)
+        return self.now() >= (
+            last_search + datetime.timedelta(days=interval_days)
+        )
+
+    def _movie_in_refresh_window(self) -> bool:
+        """普通电影真实搜索只在本地时区 22:00-23:59 执行。"""
+        hour = self.now().hour
+        return 22 <= hour < 24
 
     def _movie_probe_due(
         self,
@@ -389,6 +477,11 @@ class ReleaseGateStore:
         allow_ayclub: bool,
         probe_due: bool,
         reason: str,
+        *,
+        force_refresh: bool = False,
+        cache_only: bool = False,
+        real_search_due: bool = False,
+        interval_days: Optional[int] = None,
     ) -> Dict[str, Any]:
         return {
             "allow_ayclub": allow_ayclub,
@@ -396,34 +489,37 @@ class ReleaseGateStore:
             "probe_due": probe_due,
             "released": bool(state.get("released")),
             "reason": reason,
+            "force_refresh": bool(force_refresh),
+            "cache_only": bool(cache_only),
+            "real_search_due": bool(real_search_due),
+            "interval_days": interval_days,
+            "next_search_at": state.get("next_movie_real_search_at"),
             "state": state,
         }
 
     def evaluate_movie(
         self,
         tmdb_id: int,
+        theatrical_date: Optional[str] = None,
+        lifecycle_force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
-        判断电影本次是否允许查询 AYCLUB。
+        判断电影本次 AYCLUB 查询模式。
 
-        已确认发布后永久允许；
-        未发布时只在泄漏探测到期时允许。
+        普通任务：白天严格只读缓存；晚间窗口到期后真实查询一次。
+        新订阅、重新订阅、MP reset：允许立即强刷。
         """
         state = self.get_movie(tmdb_id)
-
-        if state.get("released"):
-            return self._movie_decision(
-                state=state,
-                allow_ayclub=True,
-                probe_due=False,
-                reason=str(
-                    state.get("release_signal")
-                    or "released"
-                ),
+        parsed_theatrical = self._parse_tmdb_date(theatrical_date)
+        theatrical_changed = False
+        if parsed_theatrical:
+            theatrical_text = parsed_theatrical.isoformat()
+            theatrical_changed = (
+                state.get("theatrical_release_date") != theatrical_text
             )
+            state["theatrical_release_date"] = theatrical_text
 
         today_text = self.today().isoformat()
-
         already_checked_today = (
             state.get("last_tmdb_check_date") == today_text
             and state.get("last_tmdb_check_status") == "ok"
@@ -435,7 +531,6 @@ class ReleaseGateStore:
             providers_ok = False
             release_dates_ok = False
 
-            # 两项数据始终同时检查，不因其中一项有结果而跳过另一项。
             with ThreadPoolExecutor(
                 max_workers=2,
                 thread_name_prefix="p115-release-gate",
@@ -448,157 +543,228 @@ class ReleaseGateStore:
                     self._fetch_movie_release_dates,
                     int(tmdb_id),
                 )
-
                 try:
                     providers = providers_future.result()
                     providers_ok = True
                 except Exception as error:
                     logger.warning(
-                        f"电影 TMDB {tmdb_id} 查询 "
-                        f"Watch Providers 失败：{error}"
+                        f"电影 TMDB {tmdb_id} 查询 Watch Providers 失败：{error}"
                     )
-
                 try:
                     release_regions = releases_future.result()
                     release_dates_ok = True
                 except Exception as error:
                     logger.warning(
-                        f"电影 TMDB {tmdb_id} 查询 "
-                        f"发行日期失败：{error}"
+                        f"电影 TMDB {tmdb_id} 查询发行日期失败：{error}"
                     )
 
             provider_countries: List[str] = []
             provider_names: List[str] = []
-
             if providers_ok:
-                (
-                    provider_countries,
-                    provider_names,
-                ) = self._analyze_watch_providers(providers)
-
+                provider_countries, provider_names = (
+                    self._analyze_watch_providers(providers)
+                )
                 state["provider_countries"] = provider_countries
                 state["provider_names"] = provider_names
 
             release_signal = None
             next_release_date = None
-
+            digital_release_date = None
+            other_release_date = None
             if release_dates_ok:
                 (
                     release_signal,
                     next_release_date,
-                ) = self._analyze_release_dates(
-                    release_regions
-                )
-
-                state["next_known_release_date"] = (
-                    next_release_date
-                )
+                    digital_release_date,
+                    other_release_date,
+                ) = self._analyze_release_dates(release_regions)
+                state["next_known_release_date"] = next_release_date
+                if digital_release_date:
+                    state["digital_release_date"] = digital_release_date
+                if other_release_date:
+                    state["other_release_date"] = other_release_date
 
             provider_released = bool(provider_countries)
             date_released = bool(release_signal)
-
             if provider_released or date_released:
                 state["released"] = True
-
                 if provider_released:
                     state["release_signal"] = "watch_provider"
                     logger.info(
-                        f"电影 TMDB {tmdb_id} 已出现全球流媒体、"
-                        f"租赁或购买提供商："
-                        f"{', '.join(provider_names) or '未知提供商'}；"
-                        f"数据由 JustWatch 通过 TMDB 提供"
+                        f"电影 TMDB {tmdb_id} 已出现全球流媒体、租赁或购买提供商："
+                        f"{', '.join(provider_names) or '未知提供商'}"
                     )
-                else:
+                elif release_signal:
                     state["release_signal"] = release_signal
-
-                    if release_signal.startswith(
-                        "release_type_6:"
-                    ):
-                        logger.info(
-                            f"电影 TMDB {tmdb_id} 已出现 "
-                            f"TMDB 电视播出发行信号；"
-                            f"该信号不等同于确认流媒体上线"
-                        )
-                    else:
-                        logger.info(
-                            f"电影 TMDB {tmdb_id} 已出现 "
-                            f"TMDB 数字或实体发行信号："
-                            f"{release_signal}"
-                        )
-
-                state["last_tmdb_check_date"] = today_text
-                state["last_tmdb_check_status"] = "ok"
-                self.save(state)
-
-                return self._movie_decision(
-                    state=state,
-                    allow_ayclub=True,
-                    probe_due=False,
-                    reason=str(state["release_signal"]),
-                )
+                    logger.info(
+                        f"电影 TMDB {tmdb_id} 已出现 TMDB 数字/实体/电视发行信号："
+                        f"{release_signal}"
+                    )
 
             if providers_ok and release_dates_ok:
                 state["last_tmdb_check_date"] = today_text
                 state["last_tmdb_check_status"] = "ok"
-                self.save(state)
             else:
-                # 查询不完整时不能确认“尚未发布”，
-                # 不更新成功检查日期，也不消耗泄漏探测。
                 state["last_tmdb_check_status"] = "error"
-                self.save(state)
+            self.save(state)
+        elif theatrical_changed:
+            # 当天已检查过 TMDB 时，也要持久化 MoviePilot 给出的影院上映日。
+            self.save(state)
 
+        # 生命周期事件是明确的用户意图，允许立即绕过缓存和时间窗口。
+        if lifecycle_force_refresh:
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=True,
+                probe_due=not bool(state.get("released")),
+                reason="lifecycle_force_refresh",
+                force_refresh=True,
+                cache_only=False,
+                real_search_due=True,
+                interval_days=self._movie_search_interval_days(state),
+            )
+
+        in_window = self._movie_in_refresh_window()
+
+        if state.get("released"):
+            interval_days = self._movie_search_interval_days(state)
+            search_due = self._movie_real_search_due(state)
+            if search_due and in_window:
                 return self._movie_decision(
                     state=state,
-                    allow_ayclub=False,
+                    allow_ayclub=True,
                     probe_due=False,
-                    reason="tmdb_error",
+                    reason="released_search_due_evening",
+                    force_refresh=True,
+                    cache_only=False,
+                    real_search_due=True,
+                    interval_days=interval_days,
                 )
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=True,
+                probe_due=False,
+                reason=(
+                    "released_cache_only_outside_evening_window"
+                    if not in_window
+                    else "released_cache_only_backoff_wait"
+                ),
+                force_refresh=False,
+                cache_only=True,
+                real_search_due=search_due,
+                interval_days=interval_days,
+            )
 
         probe_due = self._movie_probe_due(state)
+        if not probe_due:
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=False,
+                probe_due=False,
+                reason="unreleased_probe_wait",
+                interval_days=14,
+            )
+
+        if in_window:
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=True,
+                probe_due=True,
+                reason="unreleased_probe_due_evening",
+                force_refresh=True,
+                cache_only=False,
+                real_search_due=True,
+                interval_days=14,
+            )
 
         return self._movie_decision(
             state=state,
-            allow_ayclub=probe_due,
-            probe_due=probe_due,
-            reason=(
-                "leak_probe_due"
-                if probe_due
-                else "unreleased_probe_wait"
-            ),
+            allow_ayclub=True,
+            probe_due=True,
+            reason="unreleased_probe_due_cache_only_daytime",
+            force_refresh=False,
+            cache_only=True,
+            real_search_due=True,
+            interval_days=14,
         )
+
+    def mark_movie_search_result(
+        self,
+        tmdb_id: int,
+        search_status: str,
+        cached: Optional[bool],
+        force_honored: bool = False,
+        usable_candidate: Optional[bool] = None,
+    ) -> bool:
+        """记录一次真实 AYCLUB 电影查询，并计算下次允许时间。
+
+        桥接返回 ok_matched 只代表标题层面有候选。若所有 AYCLUB 分享
+        均失效、无内容或没有匹配影片文件，则按本次无可用结果退避。
+        """
+        bridge_status = str(search_status or "")
+        if bridge_status not in {"ok_empty", "ok_matched"}:
+            return False
+        real_query = bool(force_honored or cached is False)
+        if not real_query:
+            return False
+
+        effective_status = bridge_status
+        if bridge_status == "ok_matched" and usable_candidate is False:
+            effective_status = "ok_empty"
+
+        state = self.get_movie(tmdb_id)
+        now = self.now()
+        if effective_status == "ok_empty":
+            try:
+                empty_count = int(state.get("movie_empty_count") or 0) + 1
+            except (TypeError, ValueError):
+                empty_count = 1
+            state["movie_empty_count"] = empty_count
+        else:
+            state["movie_empty_count"] = 0
+
+        interval_days = (
+            self._movie_search_interval_days(state)
+            if state.get("released")
+            else 14
+        )
+        state["last_movie_real_search_at"] = now.isoformat()
+        state["last_movie_search_status"] = effective_status
+        state["last_movie_bridge_status"] = bridge_status
+        state["last_movie_search_interval_days"] = interval_days
+        state["next_movie_real_search_at"] = (
+            now + datetime.timedelta(days=interval_days)
+        ).isoformat()
+
+        if not state.get("released") and effective_status == "ok_empty":
+            state["leak_probe_done"] = True
+            state["last_leak_probe_at"] = now.isoformat()
+            state["next_leak_probe_at"] = state["next_movie_real_search_at"]
+
+        self.save(state)
+        logger.info(
+            f"电影 TMDB {tmdb_id} AYCLUB 真实查询已记录："
+            f"status={effective_status}（桥接={bridge_status}），"
+            f"连续无结果={state.get('movie_empty_count', 0)}，"
+            f"间隔={interval_days}天，下次允许={state['next_movie_real_search_at']}"
+        )
+        return True
 
     def mark_movie_probe_result(
         self,
         tmdb_id: int,
         search_status: str,
     ) -> None:
-        """
-        记录电影泄漏探测结果。
-
-        只有 AYCLUB 成功查询且明确无结果时，才消耗探测机会。
-        """
+        """兼容旧调用：仅在明确无结果时记录一次未发布电影探测。"""
         if search_status != "ok_empty":
             return
-
-        state = self.get_movie(tmdb_id)
-
-        if state.get("released"):
-            return
-
-        now = self.now()
-
-        state["leak_probe_done"] = True
-        state["last_leak_probe_at"] = now.isoformat()
-        state["next_leak_probe_at"] = (
-            now + datetime.timedelta(days=14)
-        ).isoformat()
-
-        self.save(state)
-
-        logger.info(
-            f"电影 TMDB {tmdb_id} 泄漏探测无结果，"
-            f"下一次探测时间：{state['next_leak_probe_at']}"
+        self.mark_movie_search_result(
+            tmdb_id=tmdb_id,
+            search_status=search_status,
+            cached=False,
+            force_honored=False,
         )
+
     @staticmethod
     def _normalize_episode_numbers(
         episodes: List[int],
@@ -696,6 +862,9 @@ class ReleaseGateStore:
             "aired_episodes": [],
             "future_episodes": [],
             "unknown_episodes": [],
+            "aired_episode_frontier": state.get(
+                "aired_episode_frontier"
+            ),
             "ayclub_episodes": [],
             "state": state,
         }
@@ -736,14 +905,20 @@ class ReleaseGateStore:
         unknown_missing: List[int] = []
         future_dates: List[datetime.date] = []
         all_aired_dates: List[datetime.date] = []
+        all_aired_episode_numbers: List[int] = []
 
-        for air_date_value in normalized_air_dates.values():
+        for episode_number, air_date_value in (
+            normalized_air_dates.items()
+        ):
             air_date = self._parse_tmdb_date(
                 air_date_value
             )
 
             if air_date and air_date <= today:
                 all_aired_dates.append(air_date)
+                all_aired_episode_numbers.append(
+                    episode_number
+                )
 
         for episode in missing:
             air_date = self._parse_tmdb_date(
@@ -766,6 +941,21 @@ class ReleaseGateStore:
             else None
         )
 
+        if all_aired_episode_numbers:
+            try:
+                previous_frontier = int(
+                    state.get(
+                        "aired_episode_frontier"
+                    ) or 0
+                )
+            except (TypeError, ValueError):
+                previous_frontier = 0
+
+            state["aired_episode_frontier"] = max(
+                previous_frontier,
+                max(all_aired_episode_numbers),
+            )
+
         # 以整季是否已有任意一集播出判断季度是否已经开播，
         # 不能只看当前缺失的集数。
         if all_aired_dates:
@@ -786,6 +976,9 @@ class ReleaseGateStore:
             "aired_episodes": aired_missing,
             "future_episodes": future_missing,
             "unknown_episodes": unknown_missing,
+            "aired_episode_frontier": state.get(
+                "aired_episode_frontier"
+            ),
             "ayclub_episodes": [],
             "state": state,
         }

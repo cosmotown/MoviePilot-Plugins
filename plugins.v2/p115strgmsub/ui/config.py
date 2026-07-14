@@ -106,7 +106,7 @@ class UIConfig:
                                  'props': {
                                      'model': 'cron',
                                      'label': '执行周期（Cron）',
-                                     'placeholder': '30 2,10,18 * * *',
+                                     'placeholder': '30 6,14,22 * * *',
                                      'hint': '5段 Cron：分 时 日 月 周；例：2,10,18 * * * 表示2点、10点、18点的30分执行',
                                      'persistent-hint': True,
                                      'clearable': True
@@ -223,7 +223,7 @@ class UIConfig:
                                     'props': {
                                         'model': 'classifier_url',
                                         'label': 'OpenClaw 分类服务地址',
-                                        'placeholder': 'http://192.168.5.102:11591'
+                                        'placeholder': 'http://HOST_IP:11591'
                                     }
                                 }]
                             },
@@ -295,7 +295,7 @@ class UIConfig:
                                 'props': {
                                     'type': 'info',
                                     'variant': 'tonal',
-                                    'text': 'AYCLUB：通过本机 Telegram 桥接服务查询 @ayclub_bot，并使用 TMDB ID、标题和年份精确匹配115资源。电影会每日检查流媒体与发行状态，电视剧按 TMDB 剧集播出日期控制查询；流媒体可用性数据由 JustWatch 通过 TMDB 提供。'
+                                    'text': 'AYCLUB：通过本机 Telegram 桥接服务查询已配置的影视机器人，并使用 TMDB ID、标题和年份精确匹配115资源。电影会每日检查流媒体与发行状态，电视剧按 TMDB 剧集播出日期控制查询；流媒体可用性数据由 JustWatch 通过 TMDB 提供。'
                                 }
                             }]
                         }]
@@ -555,7 +555,7 @@ class UIConfig:
             "notify": True,
             "onlyonce": False,
             "only_115": True,
-            "cron": "30 2,10,18 * * *",
+            "cron": "30 6,14,22 * * *",
 
             "unblock_site_ids": [],
             "unblock_site_names": [],
@@ -569,7 +569,7 @@ class UIConfig:
             
             # OpenClaw 七分类服务
             "classifier_enabled": False,
-            "classifier_url": "http://192.168.5.102:11591",
+            "classifier_url": "",
             "classifier_token": "",
             "classifier_timeout": 120,
             "pansou_enabled": True,

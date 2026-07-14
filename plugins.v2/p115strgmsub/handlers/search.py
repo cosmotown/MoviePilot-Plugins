@@ -177,6 +177,24 @@ class SearchHandler:
             )
             or ""
         )
+
+    def get_ayclub_last_cached(self) -> Optional[bool]:
+        """最近一次 AYCLUB 查询是否命中桥接缓存。"""
+        if not self._ayclub_client:
+            return None
+        return getattr(self._ayclub_client, "last_cached", None)
+
+    def get_ayclub_last_cache_age(self) -> Optional[int]:
+        """最近一次 AYCLUB 缓存年龄（秒）。"""
+        if not self._ayclub_client:
+            return None
+        return getattr(self._ayclub_client, "last_cache_age_seconds", None)
+
+    def was_ayclub_force_refresh_honored(self) -> bool:
+        """桥接是否确认本次强制刷新绕过了缓存。"""
+        if not self._ayclub_client:
+            return False
+        return bool(getattr(self._ayclub_client, "last_force_refresh_honored", False))
         
     def search_resources(
         self,
@@ -186,6 +204,8 @@ class SearchHandler:
         episodes: Optional[List[int]] = None,
         ayclub_first: bool = False,
         allow_ayclub: bool = True,
+        force_refresh: bool = False,
+        cache_only: bool = False,
     ) -> List[Dict]:
         """
         统一的资源搜索方法，支持电影和电视剧
@@ -211,6 +231,8 @@ class SearchHandler:
                 media_type=media_type,
                 season=season,
                 episodes=episodes,
+                force_refresh=force_refresh,
+                cache_only=(cache_only if source == "ayclub" else False),
             )
             if results:
                 return results
@@ -230,6 +252,8 @@ class SearchHandler:
         episodes: Optional[List[int]] = None,
         ayclub_first: bool = False,
         allow_ayclub: bool = True,
+        force_refresh: bool = False,
+        cache_only: bool = False,
     ) -> Iterator[Dict]:
         """
         按优先级延迟查询搜索源并逐个返回资源。
@@ -257,6 +281,8 @@ class SearchHandler:
                 media_type=media_type,
                 season=season,
                 episodes=episodes,
+                force_refresh=force_refresh,
+                cache_only=(cache_only if source == "ayclub" else False),
             )
 
             if not results:
@@ -294,6 +320,8 @@ class SearchHandler:
         media_type: MediaType,
         season: Optional[int] = None,
         episodes: Optional[List[int]] = None,
+        force_refresh: bool = False,
+        cache_only: bool = False,
     ) -> List[Dict]:
         """
         使用指定的单一搜索源查询资源
@@ -322,6 +350,8 @@ class SearchHandler:
                 media_type=media_type,
                 season=season,
                 episodes=episodes,
+                force_refresh=force_refresh,
+                cache_only=cache_only,
             )
         else:
             logger.warning(f"未知的搜索源: {source}")

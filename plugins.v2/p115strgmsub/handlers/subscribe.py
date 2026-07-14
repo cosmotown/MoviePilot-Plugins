@@ -5,14 +5,13 @@
 from typing import List, Callable, Dict, Any
 from sqlalchemy import text
 
-from app.core.metainfo import MetaInfo
 from app.chain.subscribe import SubscribeChain
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.db.models.site import Site
 from app.log import logger
 from app.schemas import MediaInfo
-from app.schemas.types import MediaType, NotificationType
+from app.schemas.types import MediaType
 
 
 class SubscribeHandler:
@@ -49,79 +48,28 @@ class SubscribeHandler:
         success_episodes: List[int]
     ):
         """
-        检查订阅是否完成，如果完成则调用官方接口
+        兼容旧调用的安全入口。
+
+        1.8.0 起不再根据插件转存结果直接写 note/lack_episode，也不 force 完成订阅。
+        仅请求 MoviePilot 使用自身媒体库口径刷新电视剧进度；电影由后续 MP 入库事件
+        和全量对账完成。
         """
         try:
-            current_note = subscribe.note or []
-            if mediainfo.type == MediaType.TV:
-                new_note = list(set(current_note).union(set(success_episodes)))
+            if getattr(subscribe, "type", None) == MediaType.TV.value:
+                result = SubscribeChain().refresh_subscribe_progress(
+                    subscribe=subscribe,
+                    scene="p115_plugin_compat",
+                )
+                logger.info(
+                    f"已交由 MoviePilot 刷新订阅 {getattr(subscribe, 'id', None)} 进度：{result}"
+                )
             else:
-                new_note = list(set(current_note).union({1}))
-
-            current_lack = subscribe.lack_episode or 0
-            total_episode = subscribe.total_episode or 0
-            start_episode = subscribe.start_episode or 1
-
-            if mediainfo.type == MediaType.TV and total_episode > 0:
-                expected_episodes = set(range(start_episode, total_episode + 1))
-                downloaded_episodes = set(new_note)
-                remaining_episodes = expected_episodes - downloaded_episodes
-                new_lack = len(remaining_episodes)
-            else:
-                new_lack = max(0, current_lack - len(success_episodes))
-
-            update_data = {}
-            if new_note != current_note:
-                update_data["note"] = new_note
-                logger.info(f"更新订阅 {subscribe.name} note：{current_note} -> {new_note}")
-            if new_lack != current_lack:
-                update_data["lack_episode"] = new_lack
-                logger.info(f"更新订阅 {subscribe.name} 缺失集数：{current_lack} -> {new_lack}")
-
-            if update_data:
-                SubscribeOper().update(subscribe.id, update_data)
-
-            if new_lack == 0:
-                logger.info(f"订阅 {subscribe.name} 已完成，准备移至历史记录")
-
-                meta = MetaInfo(subscribe.name)
-                meta.year = subscribe.year
-                meta.begin_season = subscribe.season or None
-                try:
-                    meta.type = MediaType(subscribe.type)
-                except ValueError:
-                    logger.error(f'订阅 {subscribe.name} 类型错误：{subscribe.type}')
-                    return
-
-                try:
-                    SubscribeChain().finish_subscribe_or_not(
-                        subscribe=subscribe,
-                        meta=meta,
-                        mediainfo=mediainfo,
-                        downloads=None,
-                        lefts={},
-                        force=True
-                    )
-                    logger.info(f"订阅 {subscribe.name} 已移至历史记录")
-                    if self._notify and self._post_message:
-                        season_text = f" 第{subscribe.season}季" if subscribe.type == MediaType.TV.value and subscribe.season else ""
-                        self._post_message(
-                            mtype=NotificationType.Plugin,
-                            title="【115网盘订阅追更】订阅完成",
-                            text=f"{subscribe.name}{season_text} 已完成，订阅已移至历史记录。"
-                        )
-                except Exception as e:
-                    import traceback
-                    logger.error(
-                        f"完成订阅时出错 - 订阅ID:{subscribe.id} 名称:{subscribe.name} "
-                        f"异常:{type(e).__name__}:{e}\n{traceback.format_exc()}"
-                    )
-
-        except Exception as e:
-            import traceback
-            logger.error(
-                f"检查订阅完成状态出错 - 订阅ID:{getattr(subscribe, 'id', None)} 名称:{getattr(subscribe, 'name', None)} "
-                f"异常:{type(e).__name__}:{e}\n{traceback.format_exc()}"
+                logger.info(
+                    f"电影订阅 {getattr(subscribe, 'id', None)} 等待 MoviePilot 入库/完成事件"
+                )
+        except Exception as error:
+            logger.warning(
+                f"请求 MoviePilot 刷新订阅 {getattr(subscribe, 'id', None)} 失败：{error}"
             )
 
     # ------------------ 站点写入增强 ------------------

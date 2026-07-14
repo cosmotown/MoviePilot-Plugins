@@ -3,6 +3,7 @@
 结合MoviePilot订阅功能，自动搜索115网盘资源并转存缺失剧集
 """
 import datetime
+import hashlib
 import math
 from pathlib import Path
 from threading import Lock
@@ -15,12 +16,13 @@ from sqlalchemy import text
 
 from app.core.config import settings, global_vars
 from app.core.event import Event, eventmanager
+from app.chain.subscribe import SubscribeChain
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.db.models.site import Site
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas.types import EventType, MediaType, NotificationType
+from app.schemas.types import EventType, ChainEventType, MediaType, NotificationType
 
 from .clients import (
     PanSouClient,
@@ -31,7 +33,7 @@ from .clients import (
     OpenClawClassifierClient,
     AyclubClient,
 )
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler
+from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, LifecycleStore
 from .ui import UIConfig
 from .utils import download_so_file
 
@@ -48,7 +50,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.7.0"
+    plugin_version = "1.8.3-r4"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -65,7 +67,7 @@ class P115StrgmSub(_PluginBase):
     # 配置属性
     _enabled: bool = False
     _onlyonce: bool = False
-    _cron: str = "30 2,10,18 * * *"
+    _cron: str = "30 6,14,22 * * *"
     _notify: bool = False
 
     _cookies: str = ""
@@ -124,7 +126,7 @@ class P115StrgmSub(_PluginBase):
     
     # OpenClaw 七分类服务
     _classifier_enabled: bool = False
-    _classifier_url: str = "http://192.168.5.102:11591"
+    _classifier_url: str = ""
     _classifier_token: str = ""
     _classifier_timeout: int = 120
 
@@ -147,6 +149,7 @@ class P115StrgmSub(_PluginBase):
     _subscribe_handler: Optional[SubscribeHandler] = None
     _sync_handler: Optional[SyncHandler] = None
     _api_handler: Optional[ApiHandler] = None
+    _lifecycle_store: Optional[LifecycleStore] = None
 
     _MIN_INTERVAL_HOURS: int = 8
 
@@ -587,7 +590,188 @@ class P115StrgmSub(_PluginBase):
             logger.warning(f"判断是否当天最后一次触发失败：{e}，按 23:00 兜底")
             return run_start.hour == 23 and run_start.minute == 00
 
-    # ------------------ 事件兜底：SubscribeAdded 保留，SubscribeModified 禁用写入 ------------------
+    # ------------------ MoviePilot 生命周期联动 ------------------
+
+    def _init_lifecycle_store(self):
+        if not self._lifecycle_store:
+            self._lifecycle_store = LifecycleStore(
+                get_data_func=self.get_data,
+                save_data_func=self.save_data,
+            )
+
+    @staticmethod
+    def _event_value(data: Any, key: str, default: Any = None) -> Any:
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return getattr(data, key, default)
+
+    def _schedule_lifecycle_sync(
+        self,
+        reason: str,
+        delay_seconds: int = 5,
+        subscribe_ids: Optional[List[int]] = None,
+    ):
+        """事件只定向加速关联订阅；定时全量同步负责最终一致性。"""
+        if not self._enabled:
+            return
+
+        targeted_ids: List[int] = []
+        if subscribe_ids is not None:
+            for value in subscribe_ids:
+                try:
+                    sid = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if sid > 0 and sid not in targeted_ids:
+                    targeted_ids.append(sid)
+            targeted_ids.sort()
+            if not targeted_ids:
+                logger.info(
+                    f"MoviePilot 生命周期联动没有可用订阅 ID，跳过即时同步：{reason}"
+                )
+                return
+
+        try:
+            self._ensure_toggle_scheduler()
+            run_date = (
+                datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                + datetime.timedelta(seconds=max(1, delay_seconds))
+            )
+            if targeted_ids:
+                digest = hashlib.sha256(
+                    ",".join(str(sid) for sid in targeted_ids).encode("utf-8")
+                ).hexdigest()[:12]
+                job_id = f"p115_lifecycle_sync_{digest}"
+            else:
+                job_id = "p115_lifecycle_sync_full"
+
+            self._toggle_scheduler.add_job(
+                func=self.sync_subscribes,
+                trigger="date",
+                run_date=run_date,
+                kwargs={
+                    "target_subscribe_ids": targeted_ids or None,
+                    "trigger_reason": reason,
+                },
+                id=job_id,
+                replace_existing=True,
+            )
+            if targeted_ids:
+                logger.info(
+                    f"已安排 MoviePilot 生命周期定向同步：subscribe_ids={targeted_ids}，"
+                    f"原因={reason}"
+                )
+            else:
+                logger.info(f"已安排 MoviePilot 生命周期全量同步：{reason}")
+        except Exception as error:
+            logger.warning(f"安排生命周期联动同步失败：{error}")
+
+    def _schedule_transfer_reconcile(
+        self,
+        media_key: str,
+        *,
+        success: bool,
+        delay_seconds: int = 60,
+    ):
+        """合并同一媒体连续入库事件，避免逐集刷新 MP 和触发重复全量同步。"""
+        if not self._enabled or not media_key:
+            return
+        try:
+            self._ensure_toggle_scheduler()
+            digest = hashlib.sha256(media_key.encode("utf-8")).hexdigest()[:12]
+            job_id = f"p115_transfer_reconcile_{digest}"
+            run_date = (
+                datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                + datetime.timedelta(seconds=max(5, delay_seconds))
+            )
+            self._toggle_scheduler.add_job(
+                func=self._reconcile_media_after_transfer,
+                trigger="date",
+                run_date=run_date,
+                args=[media_key, success],
+                id=job_id,
+                replace_existing=True,
+            )
+            logger.info(
+                f"已合并 MP {'入库完成' if success else '整理失败'}事件："
+                f"media_key={media_key}，将在 {max(5, delay_seconds)} 秒后统一对账"
+            )
+        except Exception as error:
+            logger.warning(f"安排 MP 入库防抖对账失败：{error}")
+
+    def _reconcile_media_after_transfer(self, media_key: str, success: bool):
+        """防抖窗口结束后，让 MP 刷新进度并定向对账关联订阅。"""
+        self._init_lifecycle_store()
+        subscribe_ids = self._lifecycle_store.active_subscribe_ids_for_media(media_key)
+        for sid in subscribe_ids:
+            try:
+                with SessionFactory() as db:
+                    subscribe = SubscribeOper(db=db).get(sid)
+                if not subscribe:
+                    continue
+                if subscribe.type == MediaType.TV.value:
+                    SubscribeChain().refresh_subscribe_progress(
+                        subscribe=subscribe,
+                        scene=(
+                            "transfer_complete_debounced"
+                            if success
+                            else "transfer_failed_debounced"
+                        ),
+                    )
+            except Exception as error:
+                logger.warning(
+                    f"防抖后让 MP 刷新订阅 {sid} 进度失败，将由定时对账恢复：{error}"
+                )
+        self._schedule_lifecycle_sync(
+            f"MP入库防抖对账 {media_key}",
+            delay_seconds=5,
+            subscribe_ids=subscribe_ids,
+        )
+
+    def _invalidate_subscribe_caches(self, subscribe_info: Any):
+        """重置订阅时只清插件/桥接缓存，不改 MoviePilot 数据。"""
+        if not subscribe_info:
+            return
+        tmdb_id = self._event_value(subscribe_info, "tmdbid") or self._event_value(subscribe_info, "tmdb_id")
+        media_type = self._event_value(subscribe_info, "type")
+        season = self._event_value(subscribe_info, "season")
+        name = self._event_value(subscribe_info, "name", "")
+        type_text = str(getattr(media_type, "value", media_type) or "")
+        is_tv = type_text == MediaType.TV.value or type_text.lower() == "tv"
+        sub_key = (
+            f"tmdb_{tmdb_id}_S{season or 1}"
+            if is_tv and tmdb_id
+            else f"tmdb_{tmdb_id}_movie"
+            if tmdb_id
+            else f"{name}_S{season or 1}"
+            if is_tv
+            else f"{name}_movie"
+        )
+        try:
+            if self._search_handler and hasattr(self._search_handler, "clear_sub_points"):
+                self._search_handler.clear_sub_points(sub_key)
+        except Exception as error:
+            logger.warning(f"清理 HDHive 订阅缓存失败：{error}")
+        try:
+            if self._sync_handler and hasattr(self._sync_handler, "invalidate_subscription_caches"):
+                self._sync_handler.invalidate_subscription_caches(
+                    media_type=("tv" if is_tv else "movie"),
+                    tmdb_id=tmdb_id,
+                    season=season,
+                )
+        except Exception as error:
+            logger.warning(f"清理发布门禁缓存失败：{error}")
+        try:
+            if self._ayclub_client and hasattr(self._ayclub_client, "invalidate_cache"):
+                self._ayclub_client.invalidate_cache(
+                    tmdb_id=tmdb_id,
+                    media_type=("tv" if is_tv else "movie"),
+                    season=season,
+                )
+        except Exception as error:
+            logger.warning(f"清理 AYCLUB 桥接缓存失败：{error}")
+
+    # ------------------ MoviePilot 订阅生命周期事件 ------------------
 
     def _get_subscribe_id_from_event(self, event: Event) -> Optional[int]:
         if not event or not event.event_data:
@@ -614,6 +798,23 @@ class P115StrgmSub(_PluginBase):
         if self._is_subscribe_excluded(sid):
             logger.info(f"新增订阅不在本插件处理范围（订阅过滤模式：{self._subscribe_filter_mode}），跳过站点同步（subscribe_id={sid}）")
             return
+        self._init_lifecycle_store()
+        event_data = event.event_data or {}
+        subscribe_info = event_data.get("subscribe_info") if isinstance(event_data, dict) else None
+        if subscribe_info is None:
+            try:
+                with SessionFactory() as db:
+                    subscribe_info = SubscribeOper(db=db).get(sid)
+            except Exception:
+                subscribe_info = None
+        lifecycle_record = self._lifecycle_store.on_added(sid, subscribe_info)
+        if lifecycle_record.get("force_refresh"):
+            self._invalidate_subscribe_caches(subscribe_info)
+            logger.info(
+                f"新增/重新订阅已开启新查询周期：subscribe_id={sid}，"
+                "已清本周期门禁缓存并要求 AYCLUB 首次查询强制刷新"
+            )
+        self._schedule_lifecycle_sync(f"新增/重新订阅 {sid}", subscribe_ids=[sid])
         try:
             self._init_subscribe_handler()
 
@@ -636,16 +837,106 @@ class P115StrgmSub(_PluginBase):
 
     @eventmanager.register(EventType.SubscribeModified)
     def on_subscribe_modified(self, event: Event):
-        """
-        禁用：不再对 subscribe.modified 做拉回写入
-        目的：用户手动修改订阅站点时，不再被自动拉回仅115
-        """
+        """响应 MP 普通修改、状态变化、重置和 Agent 更新。"""
+        sid = self._get_subscribe_id_from_event(event)
+        if not sid or self._is_subscribe_excluded(sid):
+            return
+        data = event.event_data or {}
+        scene = str(data.get("scene") or "update") if isinstance(data, dict) else "update"
+        fields = list(data.get("fields") or []) if isinstance(data, dict) else []
+        subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
+        self._init_lifecycle_store()
+        record = self._lifecycle_store.on_modified(
+            sid,
+            scene=scene,
+            subscribe_info=subscribe_info,
+            fields=fields,
+        )
+        logger.info(
+            f"收到 MP 订阅修改：subscribe_id={sid}, scene={scene}, "
+            f"fields={fields}, generation={record.get('generation')}"
+        )
+        if scene == "reset":
+            self._invalidate_subscribe_caches(subscribe_info)
+        self._schedule_lifecycle_sync(f"订阅修改 {sid}/{scene}", subscribe_ids=[sid])
+
+    @eventmanager.register(EventType.SubscribeDeleted)
+    def on_subscribe_deleted(self, event: Event):
+        """MP 删除/取消订阅后立即停止本插件继续搜索。"""
         sid = self._get_subscribe_id_from_event(event)
         if not sid:
             return
-        if self._block_system_subscribe:
-            logger.info(f"已屏蔽系统订阅：检测到订阅改动，按规则不自动拉回（subscribe_id={sid}）")
-        return
+        data = event.event_data or {}
+        subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
+        self._init_lifecycle_store()
+        self._lifecycle_store.on_deleted(sid, subscribe_info)
+        logger.info(f"收到 MP 订阅取消/删除：subscribe_id={sid}")
+
+    @eventmanager.register(EventType.SubscribeComplete)
+    def on_subscribe_complete(self, event: Event):
+        """订阅完成只接受 MP 的正式完成事件。"""
+        sid = self._get_subscribe_id_from_event(event)
+        if not sid:
+            return
+        data = event.event_data or {}
+        subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
+        self._init_lifecycle_store()
+        self._lifecycle_store.on_complete(sid, subscribe_info)
+        logger.info(f"收到 MP 订阅完成：subscribe_id={sid}")
+
+    def _handle_transfer_event(self, event: Event, success: bool):
+        data = event.event_data or {}
+        if not isinstance(data, dict):
+            return
+        mediainfo = data.get("mediainfo")
+        meta = data.get("meta")
+        if not mediainfo:
+            return
+        self._init_lifecycle_store()
+        if success:
+            matched = self._lifecycle_store.mark_transfer_complete(mediainfo, meta)
+        else:
+            transferinfo = data.get("transferinfo")
+            reason = self._event_value(transferinfo, "message", "MoviePilot 整理失败")
+            matched = self._lifecycle_store.mark_transfer_failed(mediainfo, meta, str(reason or ""))
+        media_key = self._lifecycle_store.media_key_from_event(mediainfo, meta)
+        logger.info(
+            f"收到 MP {'入库完成' if success else '整理失败'}事件："
+            f"media_key={media_key}, 匹配在途任务={len(matched)}"
+        )
+
+        # 逐集事件只负责确认在途任务；同一媒体连续事件统一防抖后再问 MP。
+        if matched:
+            self._schedule_transfer_reconcile(
+                media_key,
+                success=success,
+                delay_seconds=60 if success else 90,
+            )
+
+    @eventmanager.register(EventType.TransferComplete)
+    def on_transfer_complete(self, event: Event):
+        self._handle_transfer_event(event, True)
+
+    @eventmanager.register(EventType.TransferFailed)
+    def on_transfer_failed(self, event: Event):
+        self._handle_transfer_event(event, False)
+
+    @eventmanager.register(ChainEventType.PluginDataReset)
+    def on_plugin_data_reset(self, event: Event):
+        """MP 清理本插件配置/数据前，停止本插件自己的调度与在内存中的任务。"""
+        data = event.event_data or {}
+        if not isinstance(data, dict):
+            return
+        plugin_id = str(data.get("plugin_id") or "")
+        if plugin_id != self.__class__.__name__:
+            return
+        logger.info(
+            f"收到 MP 插件数据重置通知：reset_config={bool(data.get('reset_config'))}, "
+            f"reset_data={bool(data.get('reset_data'))}"
+        )
+        # 只停止本插件服务，不触碰 MoviePilot 本体、订阅或媒体库数据。
+        self.stop_service()
+        self._lifecycle_store = None
 
     # ------------------ init_plugin ------------------
 
@@ -657,14 +948,22 @@ class P115StrgmSub(_PluginBase):
         if config:
             self._enabled = config.get("enabled", False)
 
-            self._cron = (config.get("cron", self._cron) or "").strip()
+            configured_cron = (config.get("cron", self._cron) or "").strip()
+            if configured_cron == "30 2,10,18 * * *":
+                self._cron = "30 6,14,22 * * *"
+                logger.info(
+                    "检测到旧默认计划 02:30/10:30/18:30，"
+                    "已迁移为 06:30/14:30/22:30"
+                )
+            else:
+                self._cron = configured_cron
             if self._cron:
                 ok = self._cron_interval_ge_min_hours(self._cron, self._MIN_INTERVAL_HOURS)
                 if not ok:
                     logger.warning(
-                        f"Cron 过于频繁（要求间隔>= {self._MIN_INTERVAL_HOURS}h）：{self._cron}，已回退默认 30 */8 * * *"
+                        f"Cron 过于频繁（要求间隔>= {self._MIN_INTERVAL_HOURS}h）：{self._cron}，已回退默认 30 6,14,22 * * *"
                     )
-                    self._cron = "30 */8 * * *"
+                    self._cron = "30 6,14,22 * * *"
 
             self._notify = config.get("notify", False)
             self._onlyonce = config.get("onlyonce", False)
@@ -768,7 +1067,7 @@ class P115StrgmSub(_PluginBase):
             self._classifier_url = (
                 config.get(
                     "classifier_url",
-                    "http://192.168.5.102:11591",
+                    "",
                 )
                 or ""
             ).strip()
@@ -1009,6 +1308,7 @@ class P115StrgmSub(_PluginBase):
 
     def _init_handlers(self):
         self._init_subscribe_handler()
+        self._init_lifecycle_store()
 
         self._search_handler = SearchHandler(
             pansou_client=self._pansou_client,
@@ -1047,7 +1347,8 @@ class P115StrgmSub(_PluginBase):
             notify=self._notify,
             post_message_func=self.post_message,
             get_data_func=self.get_data,
-            save_data_func=self.save_data
+            save_data_func=self.save_data,
+            lifecycle_store=self._lifecycle_store
         )
 
         self._api_handler = ApiHandler(
@@ -1200,7 +1501,10 @@ class P115StrgmSub(_PluginBase):
                 services.append({
                     "id": "P115StrgmSub",
                     "name": "115网盘订阅追更服务",
-                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "trigger": CronTrigger.from_crontab(
+                        self._cron,
+                        timezone=pytz.timezone(settings.TZ),
+                    ),
                     "func": self.sync_subscribes,
                     "kwargs": {}
                 })
@@ -1228,7 +1532,27 @@ class P115StrgmSub(_PluginBase):
     # 必备：_do_sync（返回 bool）
     # ======================================================================
 
-    def _do_sync(self) -> bool:
+    def _do_sync(
+        self,
+        target_subscribe_ids: Optional[List[int]] = None,
+        trigger_reason: str = "",
+    ) -> bool:
+        targeted_request = target_subscribe_ids is not None
+        target_ids: Set[int] = set()
+        if targeted_request:
+            for value in target_subscribe_ids or []:
+                try:
+                    sid = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if sid > 0:
+                    target_ids.add(sid)
+            if not target_ids:
+                logger.info(
+                    f"定向订阅同步没有有效订阅 ID，跳过：{trigger_reason or '未提供原因'}"
+                )
+                return True
+
         # 至少启用一个搜索源
         if (
             not self._pansou_enabled
@@ -1265,13 +1589,19 @@ class P115StrgmSub(_PluginBase):
                 )
             return False
 
-        logger.info("开始执行 115 网盘订阅同步...")
-        if self._notify:
-            self.post_message(
-                mtype=NotificationType.Plugin,
-                title="【115网盘订阅追更】开始执行",
-                text="正在扫描订阅列表并同步缺失内容..."
+        if targeted_request:
+            logger.info(
+                f"开始执行 115 网盘定向订阅同步：subscribe_ids={sorted(target_ids)}，"
+                f"原因={trigger_reason or 'MoviePilot生命周期事件'}"
             )
+        else:
+            logger.info("开始执行 115 网盘订阅同步...")
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="【115网盘订阅追更】开始执行",
+                    text="正在扫描订阅列表并同步缺失内容..."
+                )
 
         # reset api counters
         try:
@@ -1294,13 +1624,41 @@ class P115StrgmSub(_PluginBase):
         except Exception:
             pass
 
-        # 获取订阅
+        # 获取 MoviePilot 全部活动订阅。生命周期状态仍用全量列表对账，
+        # 业务处理阶段再按目标 ID 过滤，避免把未选中的活动订阅误标记为失活。
         with SessionFactory() as db:
-            subscribes = SubscribeOper(db=db).list("N,R")
+            all_subscribes = SubscribeOper(db=db).list("N,R")
+
+        self._init_lifecycle_store()
+        self._lifecycle_store.reconcile_active(all_subscribes or [])
+
+        if targeted_request:
+            subscribes = [
+                subscribe for subscribe in (all_subscribes or [])
+                if int(subscribe.id) in target_ids
+            ]
+            found_ids = {int(subscribe.id) for subscribe in subscribes}
+            missing_ids = sorted(target_ids - found_ids)
+            if missing_ids:
+                logger.info(
+                    f"定向同步目标已不在 MoviePilot 活动订阅中，跳过：{missing_ids}"
+                )
+            if not subscribes:
+                logger.info(
+                    f"定向订阅同步结束：没有仍处于活动状态的目标订阅，"
+                    f"原因={trigger_reason or 'MoviePilot生命周期事件'}"
+                )
+                return True
+            logger.info(
+                f"本次仅处理 MoviePilot 目标订阅："
+                f"{[int(subscribe.id) for subscribe in subscribes]}"
+            )
+        else:
+            subscribes = all_subscribes or []
 
         if not subscribes:
             logger.info("无订阅数据")
-            if self._notify:
+            if self._notify and not targeted_request:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【115网盘订阅追更】执行完成",
@@ -1357,12 +1715,18 @@ class P115StrgmSub(_PluginBase):
 
         self.save_data('history', history)
 
-        logger.info(f"115 网盘订阅同步完成，共转存 {transferred_count} 个文件")
+        if targeted_request:
+            logger.info(
+                f"115 网盘定向订阅同步完成：subscribe_ids={sorted(target_ids)}，"
+                f"共转存 {transferred_count} 个文件"
+            )
+        else:
+            logger.info(f"115 网盘订阅同步完成，共转存 {transferred_count} 个文件")
 
         if self._notify:
             if transferred_count > 0:
                 self._sync_handler.send_transfer_notification(transfer_details, transferred_count)
-            else:
+            elif not targeted_request:
                 self.post_message(
                     mtype=NotificationType.Plugin,
                     title="【115网盘订阅追更】执行完成",
@@ -1378,24 +1742,38 @@ class P115StrgmSub(_PluginBase):
 
     # ------------------ 同步入口（触发条件1） ------------------
 
-    def sync_subscribes(self):
+    def sync_subscribes(
+        self,
+        target_subscribe_ids: Optional[List[int]] = None,
+        trigger_reason: str = "",
+    ):
         with lock:
             tz = pytz.timezone(settings.TZ)
             run_start = datetime.datetime.now(tz=tz)
 
             success = False
             try:
-                success = self._do_sync()
+                success = self._do_sync(
+                    target_subscribe_ids=target_subscribe_ids,
+                    trigger_reason=trigger_reason,
+                )
             except Exception as e:
                 logger.error(f"同步任务异常：{e}")
                 success = False
             finally:
-                # 仅在用户开启了���蔽系统订阅时，才执行自动窗口切换逻辑
-                if success and self._block_system_subscribe and self._is_last_run_today(run_start):
+                # 生命周期定向同步不参与“当天最后一次全量任务”的站点窗口切换。
+                if (
+                    target_subscribe_ids is None
+                    and success
+                    and self._block_system_subscribe
+                    and self._is_last_run_today(run_start)
+                ):
                     if int(self._unblock_delay_minutes) < 0 or (not self._window_enabled()):
                         self._enter_blocked(reason="触发条件1")
                     else:
-                        self._schedule_unblock_after_delay(datetime.datetime.now(tz=pytz.timezone(settings.TZ)))
+                        self._schedule_unblock_after_delay(
+                            datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+                        )
 
     # ------------------ 业务 API（保留） ------------------
 
