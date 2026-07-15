@@ -163,7 +163,7 @@ class UIConfig:
                                         'label': '每天最后一次任务后延迟（分钟）',
                                         'type': 'number',
                                         'placeholder': '5',
-                                        'hint': '设为-1表示禁用窗口：始终保持屏蔽（仅115网盘）；否则23:00兜底恢复系统订阅',
+                                        'hint': '设为-1表示禁用窗口；否则延迟后先等待MoviePilot/媒体库确认入库，再开放PT窗口',
                                         'persistent-hint': True,
                                         'clearable': True
                                     }

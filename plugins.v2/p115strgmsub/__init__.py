@@ -50,7 +50,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.3-r4"
+    plugin_version = "1.8.3-r5"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -152,6 +152,8 @@ class P115StrgmSub(_PluginBase):
     _lifecycle_store: Optional[LifecycleStore] = None
 
     _MIN_INTERVAL_HOURS: int = 8
+    _PT_GATE_RECHECK_SECONDS: int = 300
+    _PT_GATE_MAX_WAIT_MINUTES: int = 90
 
     # ------------------ 调度器 ------------------
 
@@ -163,7 +165,11 @@ class P115StrgmSub(_PluginBase):
     def _cancel_toggle_jobs(self):
         if not self._toggle_scheduler:
             return
-        for job_id in ["p115_unblock_job", "p115_reblock_job"]:
+        for job_id in [
+            "p115_unblock_job",
+            "p115_reblock_job",
+            "p115_pt_gate_job",
+        ]:
             try:
                 self._toggle_scheduler.remove_job(job_id)
             except Exception:
@@ -549,6 +555,7 @@ class P115StrgmSub(_PluginBase):
         logger.info(f"已安排：{run_date} 切换为已屏蔽系统订阅（仅115网盘）")
 
     def _schedule_unblock_after_delay(self, base_time: datetime.datetime):
+        """最后一次全量任务后，先通过 MP/媒体库入库屏障再开放 PT。"""
         delay = int(self._unblock_delay_minutes)
         if delay < 0:
             return
@@ -561,15 +568,164 @@ class P115StrgmSub(_PluginBase):
         tz = pytz.timezone(settings.TZ)
         base_time = base_time.astimezone(tz)
         run_date = base_time + datetime.timedelta(minutes=delay)
+        deadline = run_date + datetime.timedelta(
+            minutes=self._PT_GATE_MAX_WAIT_MINUTES
+        )
 
         self._toggle_scheduler.add_job(
-            func=lambda: self._enter_unblocked(reason="触发条件1：最后一次任务"),
+            func=self._check_pt_unblock_gate,
             trigger="date",
             run_date=run_date,
-            id="p115_unblock_job",
-            replace_existing=True
+            kwargs={
+                "deadline_text": deadline.isoformat(),
+                "attempt": 1,
+            },
+            id="p115_pt_gate_job",
+            replace_existing=True,
         )
-        logger.info(f"已安排：{run_date} 切换为已恢复系统订阅（延迟={delay}min）")
+        logger.info(
+            f"已安排 PT 开放前入库屏障：首次检查={run_date}，"
+            f"最长等待={self._PT_GATE_MAX_WAIT_MINUTES}分钟，"
+            f"初始延迟={delay}分钟"
+        )
+
+    @staticmethod
+    def _pt_gate_task_label(task: Dict[str, Any]) -> str:
+        subscribe_id = task.get("subscribe_id")
+        episode = task.get("episode")
+        status = task.get("status") or "unknown"
+        suffix = f"/E{int(episode):02d}" if episode is not None else "/movie"
+        return f"sub={subscribe_id}{suffix}:{status}"
+
+    def _refresh_pt_gate_with_mp(self, subscribe_ids: List[int]) -> None:
+        """只问 MoviePilot/媒体库，不登录115、不调用任何搜索源。"""
+        self._init_lifecycle_store()
+        if not self._sync_handler:
+            self._init_handlers()
+
+        try:
+            with SessionFactory() as db:
+                active_subscribes = SubscribeOper(db=db).list("N,R") or []
+            self._lifecycle_store.reconcile_active(active_subscribes)
+            active_by_id = {
+                int(subscribe.id): subscribe
+                for subscribe in active_subscribes
+                if getattr(subscribe, "id", None) is not None
+            }
+        except Exception as error:
+            logger.warning(
+                f"PT开放前读取活动订阅失败，继续保持屏蔽：{error}"
+            )
+            return
+
+        for sid in subscribe_ids:
+            subscribe = active_by_id.get(int(sid))
+            if not subscribe:
+                logger.info(
+                    f"PT开放前订阅 {sid} 已不在活动列表，不再阻塞窗口"
+                )
+                continue
+            try:
+                self._sync_handler.reconcile_subscribe_with_mp(subscribe)
+            except Exception as error:
+                logger.warning(
+                    f"PT开放前定向确认订阅 {sid} 失败，继续保持屏蔽：{error}"
+                )
+
+    def _check_pt_unblock_gate(self, deadline_text: str, attempt: int = 1):
+        """串行执行 PT 开放前入库屏障，避免与同步/事件对账竞态。"""
+        with lock:
+            self._check_pt_unblock_gate_locked(deadline_text, attempt)
+
+    def _check_pt_unblock_gate_locked(
+        self,
+        deadline_text: str,
+        attempt: int = 1,
+    ):
+        """仅当 MP/Emby 不再认为本插件刚投递的内容缺失时才开放 PT。"""
+        if not self._enabled or not self._window_enabled():
+            return
+        if not self._block_system_subscribe:
+            return
+
+        tz = pytz.timezone(settings.TZ)
+        now = datetime.datetime.now(tz=tz)
+        try:
+            deadline = datetime.datetime.fromisoformat(str(deadline_text))
+            if deadline.tzinfo is None:
+                deadline = tz.localize(deadline)
+            else:
+                deadline = deadline.astimezone(tz)
+        except (TypeError, ValueError):
+            deadline = now + datetime.timedelta(
+                minutes=self._PT_GATE_MAX_WAIT_MINUTES
+            )
+
+        self._init_lifecycle_store()
+        blocking = self._lifecycle_store.blocking_pending_tasks()
+        if blocking:
+            subscribe_ids = sorted({
+                int(task.get("subscribe_id"))
+                for task in blocking
+                if task.get("subscribe_id") is not None
+            })
+            logger.info(
+                f"PT开放前入库屏障第 {attempt} 次检查："
+                f"仍有 {len(blocking)} 个活动在途任务，"
+                f"向 MoviePilot/媒体库定向复核订阅 {subscribe_ids}"
+            )
+            self._refresh_pt_gate_with_mp(subscribe_ids)
+            blocking = self._lifecycle_store.blocking_pending_tasks()
+            now = datetime.datetime.now(tz=tz)
+
+        if not blocking:
+            logger.info(
+                "PT开放前入库屏障已通过：MoviePilot/媒体库已确认所有活动在途任务，"
+                "现在开放系统订阅窗口"
+            )
+            self._enter_unblocked(
+                reason="最后一次任务：MP/Emby入库屏障已通过"
+            )
+            return
+
+        if now >= deadline:
+            labels = [self._pt_gate_task_label(task) for task in blocking[:12]]
+            logger.warning(
+                f"PT开放前入库屏障等待超过 {self._PT_GATE_MAX_WAIT_MINUTES} 分钟，"
+                f"当晚跳过 PT 窗口，避免重复下载；"
+                f"仍在途={labels}"
+            )
+            if self._notify:
+                self.post_message(
+                    mtype=NotificationType.Plugin,
+                    title="【115网盘订阅追更】已跳过本次PT窗口",
+                    text=(
+                        "MoviePilot/媒体库在等待上限内仍未确认本轮入库，"
+                        "为避免重复下载，本次保持系统订阅屏蔽。"
+                    ),
+                )
+            self._enter_blocked(reason="PT开放前入库屏障超时")
+            return
+
+        next_run = now + datetime.timedelta(
+            seconds=self._PT_GATE_RECHECK_SECONDS
+        )
+        labels = [self._pt_gate_task_label(task) for task in blocking[:12]]
+        self._toggle_scheduler.add_job(
+            func=self._check_pt_unblock_gate,
+            trigger="date",
+            run_date=next_run,
+            kwargs={
+                "deadline_text": deadline.isoformat(),
+                "attempt": int(attempt) + 1,
+            },
+            id="p115_pt_gate_job",
+            replace_existing=True,
+        )
+        logger.info(
+            f"PT开放前入库屏障未通过，继续保持屏蔽；"
+            f"仍在途={labels}，下次检查={next_run}"
+        )
 
     # ------------------ 触发条件1：最后一次任务判断 ------------------
 

@@ -551,6 +551,103 @@ class SyncHandler:
 
         return result["target_dir"]
 
+    def reconcile_subscribe_with_mp(self, subscribe: Any) -> bool:
+        """仅使用 MoviePilot 官方媒体库口径确认在途任务，不触发资源搜索。
+
+        返回 True 表示本次完成了有效的 MP 缺失状态读取；False 表示识别或
+        查询失败，调用方应继续保持 PT 屏蔽。
+        """
+        try:
+            is_tv = subscribe.type == MediaType.TV.value
+            media_type = MediaType.TV if is_tv else MediaType.MOVIE
+            meta = MetaInfo(subscribe.name)
+            meta.year = subscribe.year
+            meta.type = media_type
+            if is_tv:
+                meta.begin_season = subscribe.season or 1
+
+            mediainfo: MediaInfo = self._chain.recognize_media(
+                meta=meta,
+                mtype=media_type,
+                tmdbid=subscribe.tmdbid,
+                doubanid=subscribe.doubanid,
+                cache=True,
+            )
+            if not mediainfo:
+                logger.warning(
+                    f"PT开放前无法识别媒体，继续保持屏蔽：{subscribe.name}"
+                )
+                return False
+
+            mp_subscribe_chain = SubscribeChain()
+            if is_tv:
+                try:
+                    mp_subscribe_chain.refresh_subscribe_progress(
+                        subscribe=subscribe,
+                        scene="pt_unblock_gate",
+                    )
+                except Exception as error:
+                    logger.warning(
+                        f"PT开放前刷新订阅 {subscribe.id} 进度失败，"
+                        f"继续使用 MP 缺失接口确认：{error}"
+                    )
+
+            mediakey = mediainfo.tmdb_id or mediainfo.douban_id
+            exist_flag, no_exists = mp_subscribe_chain.resolve_subscribe_missing(
+                subscribe=subscribe,
+                meta=meta,
+                mediainfo=mediainfo,
+                mediakey=mediakey,
+            )
+            media_key = self._lifecycle.media_key_from_subscribe(subscribe)
+
+            if exist_flag:
+                confirmed = self._lifecycle.reconcile_missing(
+                    media_key,
+                    media_satisfied=True,
+                )
+                logger.info(
+                    f"PT开放前 MP/媒体库确认已满足：{subscribe.name}，"
+                    f"确认在途任务={len(confirmed)}"
+                )
+                return True
+
+            if not is_tv:
+                logger.info(
+                    f"PT开放前 MP/媒体库仍未确认电影入库：{subscribe.name}"
+                )
+                return True
+
+            season = int(meta.begin_season or 1)
+            missing_episodes = self._extract_missing_episodes(
+                no_exists=no_exists,
+                mediakey=mediakey,
+                season=season,
+            )
+            if not missing_episodes:
+                logger.warning(
+                    f"PT开放前 MP 返回未满足但没有可解析的缺失集："
+                    f"{subscribe.name} S{season}，本轮不放行"
+                )
+                return False
+
+            confirmed = self._lifecycle.reconcile_missing(
+                media_key,
+                missing_episodes=missing_episodes,
+            )
+            logger.info(
+                f"PT开放前 MP/媒体库缺失确认：{subscribe.name} S{season}，"
+                f"仍缺={missing_episodes}，确认在途任务={len(confirmed)}"
+            )
+            return True
+
+        except Exception as error:
+            logger.warning(
+                f"PT开放前读取 MoviePilot 缺失状态失败："
+                f"subscribe_id={getattr(subscribe, 'id', '?')}，错误={error}"
+            )
+            return False
+
     def process_movie_subscribe(
         self,
         subscribe,

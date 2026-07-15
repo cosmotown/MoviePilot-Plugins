@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合 MoviePilot 订阅与媒体库状态，自动搜索并转存缺失的电影和剧集。",
     "labels": "订阅,115网盘,STRM",
-    "version": "1.8.3-r4",
+    "version": "1.8.3-r5",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.8.3-r5": "新增 PT 开放前 MoviePilot/媒体库入库屏障：晚间任务有活动在途转存时保持原生订阅屏蔽，每5分钟定向复核相关订阅，最长等待90分钟；确认不再缺失后才开放 PT，超时则跳过当晚窗口，避免 Emby 尚未入库时重复下载。",
       "v1.8.3-r4": "新增电影合集按目标年份排除其他影片；同一电影多版本只提交一个具体文件 ID，并按订阅过滤、片名、分辨率、片源、HDR、音轨、编码与大小择优；保留生命周期定向同步。",
       "v1.8.3-r3": "订阅新增、修改与重置只处理对应 subscribe_id；整理事件防抖后仅对账相关订阅；定时、立即运行与远程命令仍保持全量同步。",
       "v1.8.3-r2": "电影普通任务仅在晚间窗口按发布阶段与无结果退避执行真实 AYCLUB 查询；白天只读缓存；新订阅、重新订阅和 reset 可立即强制刷新。",

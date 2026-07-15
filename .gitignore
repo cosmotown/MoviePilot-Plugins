@@ -62,3 +62,12 @@ p115strgmsub-backup-*/
 # Never commit user-specific runtime configuration
 config.local.*
 local_settings.py
+
+# Runtime sessions / private deployment material
+*.session
+*.session-journal
+session/
+sessions/
+backups/
+*.bak
+*.db-journal

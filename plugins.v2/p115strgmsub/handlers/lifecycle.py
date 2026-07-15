@@ -513,6 +513,53 @@ class LifecycleStore:
                 self._save(state)
             return result
 
+    def blocking_pending_tasks(self) -> List[Dict[str, Any]]:
+        """返回仍可能造成 MoviePilot 原生订阅重复下载的活动在途任务。
+
+        仅活动订阅且状态仍为 pending_transfer / pending_organize / organized
+        的任务会阻止 PT 窗口开启。整理失败、已由 MP 确认、已取消或已完成
+        的订阅不会阻塞。
+        """
+        with self._lock:
+            state = self._load()
+            active_ids = {
+                int(record.get("subscribe_id"))
+                for record in state.get("subscriptions", {}).values()
+                if record.get("active")
+                and record.get("subscribe_id") is not None
+            }
+
+            changed = False
+            media_keys = {
+                str(task.get("media_key"))
+                for task in state.get("pending", {}).values()
+                if task.get("media_key")
+            }
+            for media_key in media_keys:
+                changed = self._expire_stale(state, media_key) or changed
+
+            result: List[Dict[str, Any]] = []
+            for task in state.get("pending", {}).values():
+                try:
+                    subscribe_id = int(task.get("subscribe_id"))
+                except (TypeError, ValueError):
+                    continue
+                if subscribe_id not in active_ids or not self._is_live_pending(task):
+                    continue
+                result.append(dict(task))
+
+            if changed:
+                self._save(state)
+
+            return sorted(
+                result,
+                key=lambda item: (
+                    int(item.get("subscribe_id") or 0),
+                    int(item.get("episode") or 0),
+                    str(item.get("task_id") or ""),
+                ),
+            )
+
     @staticmethod
     def episodes_from_meta(meta: Any) -> Set[int]:
         values: List[Any] = []
