@@ -82,6 +82,21 @@ class AyclubClient:
                 and parsed.path != "/"
             )
         )    
+
+    @staticmethod
+    def _is_allowed_ed2k_url(source_url: str) -> bool:
+        """只接受完整 ED2K file 链接，后续提交时保留原始字符串。"""
+        value = (source_url or "").strip()
+        lowered = value.casefold()
+        return bool(
+            20 <= len(value) <= 16384
+            and "\r" not in value
+            and "\n" not in value
+            and lowered.startswith("ed2k://|file|")
+            and lowered.endswith("|/")
+            and value.count("|") >= 5
+        )
+
     def health(self) -> bool:
         """检查桥接服务是否正常且 Telegram Session 已授权。"""
         if not self.is_ready:
@@ -322,23 +337,33 @@ class AyclubClient:
             results: List[Dict[str, Any]] = []
 
             for item in data.get("matches") or []:
-                share_url = (item.get("source") or "").strip()
+                source_url = (item.get("source") or "").strip()
                 resource_title = (item.get("title") or "").strip()
+                source_kind = str(item.get("source_kind") or "").strip().casefold()
 
-                if (
-                    not share_url
-                    or not resource_title
-                    or not self._is_allowed_share_url(
-                        share_url
-                    )
-                ):
+                if not source_kind:
+                    if self._is_allowed_share_url(source_url):
+                        source_kind = "115"
+                    elif self._is_allowed_ed2k_url(source_url):
+                        source_kind = "ed2k"
+
+                source_valid = (
+                    self._is_allowed_share_url(source_url)
+                    if source_kind == "115"
+                    else self._is_allowed_ed2k_url(source_url)
+                    if source_kind == "ed2k"
+                    else False
+                )
+
+                if not source_url or not resource_title or not source_valid:
                     continue
 
                 results.append({
-                    "url": share_url,
+                    "url": source_url,
                     "title": resource_title,
                     "update_time": "",
                     "source": "ayclub",
+                    "source_kind": source_kind,
                     "tmdb_id": item.get("tmdb_id"),
                     "year": item.get("year"),
                     "season": item.get("season"),
@@ -362,12 +387,12 @@ class AyclubClient:
                 self.last_status = "invalid_result"
                 self.last_error = (
                     "桥接服务返回 matched=true，"
-                    "但没有包含有效链接和标题的资源项"
+                    "但没有包含有效 115/ED2K 链接和标题的资源项"
                 )
 
             logger.info(
                 f"AYCLUB 找到 {len(results)} 个精确匹配的 "
-                f"115cdn 资源，扫描页数："
+                f"资源（115/ED2K），扫描页数："
                 f"{data.get('pages_scanned', 0)}，"
                 f"状态：{self.last_status}，"
                 f"缓存命中：{self.last_cached}，"

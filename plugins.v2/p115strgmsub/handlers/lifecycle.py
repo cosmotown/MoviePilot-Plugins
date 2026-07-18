@@ -22,6 +22,7 @@ class LifecycleStore:
     DATA_KEY = "lifecycle_state"
     SCHEMA_VERSION = 2
     PENDING_TTL_HOURS = 12
+    ED2K_PENDING_TTL_HOURS = 24
 
     def __init__(
         self,
@@ -457,7 +458,11 @@ class LifecycleStore:
                     "share_ref": share_ref,
                     "target_path": target_path,
                     "source": source,
-                    "status": "pending_organize",
+                    "status": (
+                        "pending_transfer"
+                        if str(source or "") == "ayclub_ed2k"
+                        else "pending_organize"
+                    ),
                     "created_at": old.get("created_at") or self._now_text(),
                     "updated_at": self._now_text(),
                 }
@@ -471,10 +476,16 @@ class LifecycleStore:
 
     def _expire_stale(self, state: Dict[str, Any], media_key: str) -> bool:
         changed = False
-        deadline = self._now() - datetime.timedelta(hours=self.PENDING_TTL_HOURS)
+        now = self._now()
         for task in state["pending"].values():
             if task.get("media_key") != media_key or not self._is_live_pending(task):
                 continue
+            ttl_hours = (
+                self.ED2K_PENDING_TTL_HOURS
+                if str(task.get("source") or "") == "ayclub_ed2k"
+                else self.PENDING_TTL_HOURS
+            )
+            deadline = now - datetime.timedelta(hours=ttl_hours)
             created = self._parse_time(task.get("created_at"))
             if created and created < deadline:
                 task["status"] = "stale"

@@ -254,6 +254,7 @@ class SearchHandler:
         allow_ayclub: bool = True,
         force_refresh: bool = False,
         cache_only: bool = False,
+        yield_source_end: bool = False,
     ) -> Iterator[Dict]:
         """
         按优先级延迟查询搜索源并逐个返回资源。
@@ -312,6 +313,12 @@ class SearchHandler:
                 result = dict(resource)
                 result.setdefault("search_source", source)
                 yield result
+
+            if yield_source_end:
+                yield {
+                    "_source_end": True,
+                    "search_source": source,
+                }
 
     def search_single_source(
         self,

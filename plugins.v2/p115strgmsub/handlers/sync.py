@@ -33,6 +33,8 @@ class SyncHandler:
     AYCLUB_REFRESH_WINDOW_START_HOUR = 22
     AYCLUB_REFRESH_WINDOW_END_HOUR = 24
     AYCLUB_DAILY_REFRESH_RETENTION_DAYS = 30
+    ED2K_DISPATCH_DATA_KEY = "ed2k_dispatch_history"
+    ED2K_DISPATCH_TTL_HOURS = 24
 
     def __init__(
         self,
@@ -192,6 +194,209 @@ class SyncHandler:
             except (TypeError, ValueError):
                 pass
         return {episode for episode in result if episode > 0}
+
+
+    @staticmethod
+    def _is_ed2k_resource(resource: Dict[str, Any]) -> bool:
+        source_kind = str(resource.get("source_kind") or "").strip().casefold()
+        source_url = str(resource.get("url") or "").strip()
+        lowered = source_url.casefold()
+        return bool(
+            source_kind in {"", "ed2k"}
+            and 20 <= len(source_url) <= 16384
+            and "\r" not in source_url
+            and "\n" not in source_url
+            and lowered.startswith("ed2k://|file|")
+            and lowered.endswith("|/")
+            and source_url.count("|") >= 5
+        )
+
+    @staticmethod
+    def _ed2k_source_ref(source_url: str) -> str:
+        return hashlib.sha256(
+            (source_url or "").encode("utf-8")
+        ).hexdigest()[:16]
+
+    def _load_ed2k_dispatch_history(self) -> Dict[str, Dict[str, Any]]:
+        if not self._get_data:
+            return {}
+        try:
+            raw = self._get_data(self.ED2K_DISPATCH_DATA_KEY) or {}
+        except Exception as error:
+            logger.warning(f"读取 ED2K 提交去重记录失败：{error}")
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        retained: Dict[str, Dict[str, Any]] = {}
+        changed = False
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                changed = True
+                continue
+            submitted_at = self._parse_utc_datetime(value.get("submitted_at"))
+            if not submitted_at:
+                changed = True
+                continue
+            age_hours = (now - submitted_at).total_seconds() / 3600
+            if age_hours <= self.ED2K_DISPATCH_TTL_HOURS:
+                retained[str(key)] = value
+            else:
+                changed = True
+
+        if changed:
+            self._save_ed2k_dispatch_history(retained)
+        return retained
+
+    def _save_ed2k_dispatch_history(
+        self,
+        history: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not self._save_data:
+            return
+        try:
+            self._save_data(self.ED2K_DISPATCH_DATA_KEY, history)
+        except Exception as error:
+            logger.warning(f"保存 ED2K 提交去重记录失败：{error}")
+
+    def _register_ed2k_pending(
+        self,
+        *,
+        subscribe: Any,
+        media_key: str,
+        source_ref: str,
+        resource_title: str,
+        episodes: Optional[List[int]],
+        attempt_id: str,
+    ) -> None:
+        normalized_episodes = []
+        for value in episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0 and episode not in normalized_episodes:
+                normalized_episodes.append(episode)
+        normalized_episodes.sort()
+
+        if normalized_episodes:
+            file_items = [
+                {
+                    "episode": episode,
+                    "id": f"ed2k:{source_ref}:{attempt_id}:{episode}",
+                    "name": resource_title,
+                }
+                for episode in normalized_episodes
+            ]
+        else:
+            file_items = [{
+                "id": f"ed2k:{source_ref}:{attempt_id}",
+                "name": resource_title,
+            }]
+
+        self._lifecycle.add_pending(
+            subscribe=subscribe,
+            media_key=media_key,
+            episodes=normalized_episodes or None,
+            file_items=file_items,
+            share_ref=f"ed2k:{source_ref}",
+            target_path="/OpenClaw_ED2K下载中",
+            source="ayclub_ed2k",
+        )
+
+    def _dispatch_ed2k_resource(
+        self,
+        *,
+        subscribe: Any,
+        media_key: str,
+        resource: Dict[str, Any],
+        mediainfo: MediaInfo,
+        media_type: str,
+        season: Optional[int] = None,
+        episodes: Optional[List[int]] = None,
+    ) -> tuple[bool, bool]:
+        """提交 ED2K；返回 (已接受或去重命中, 是否去重命中)。"""
+        source_url = str(resource.get("url") or "").strip()
+        resource_title = str(resource.get("title") or "").strip()
+        if resource_title.casefold().startswith("ed2k://"):
+            resource_title = "ED2K resource"
+        resource_title = resource_title[:500]
+        source_ref = self._ed2k_source_ref(source_url)
+
+        if not self._is_ed2k_resource(resource):
+            return False, False
+
+        if (
+            not self._classifier_client
+            or not hasattr(self._classifier_client, "submit_ed2k")
+        ):
+            logger.warning(
+                f"无法提交 ED2K：OpenClaw 客户端未就绪，ref={source_ref}"
+            )
+            return False, False
+
+        subscribe_id = int(getattr(subscribe, "id"))
+        generation = self._lifecycle.generation(subscribe_id)
+        dispatch_key = f"{subscribe_id}:{generation}:{source_ref}"
+        history = self._load_ed2k_dispatch_history()
+        old = history.get(dispatch_key) or {}
+
+        if old:
+            attempt_id = str(old.get("attempt_id") or "existing")
+            self._register_ed2k_pending(
+                subscribe=subscribe,
+                media_key=media_key,
+                source_ref=source_ref,
+                resource_title=resource_title,
+                episodes=episodes,
+                attempt_id=attempt_id,
+            )
+            logger.info(
+                f"ED2K 本订阅周期已提交，跳过重复 POST：ref={source_ref}"
+            )
+            return True, True
+
+        result = self._classifier_client.submit_ed2k(
+            source_url=source_url,
+            media_type=media_type,
+            title=mediainfo.title,
+            year=mediainfo.year,
+            tmdb_id=mediainfo.tmdb_id,
+            season=season,
+            episodes=episodes,
+            resource_title=resource_title,
+        )
+        if not result:
+            return False, False
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        attempt_id = str(int(now.timestamp()))
+        history[dispatch_key] = {
+            "subscribe_id": subscribe_id,
+            "generation": generation,
+            "media_key": media_key,
+            "source_ref": source_ref,
+            "resource_title": resource_title,
+            "episodes": list(episodes or []),
+            "attempt_id": attempt_id,
+            "submitted_at": now.isoformat(),
+            "status": str(result.get("status") or "accepted"),
+        }
+        self._save_ed2k_dispatch_history(history)
+        self._register_ed2k_pending(
+            subscribe=subscribe,
+            media_key=media_key,
+            source_ref=source_ref,
+            resource_title=resource_title,
+            episodes=episodes,
+            attempt_id=attempt_id,
+        )
+        logger.info(
+            f"ED2K 已交给 OpenClaw/p115 后端：ref={source_ref}，"
+            f"等待 MoviePilot 入库事件"
+        )
+        return True, False
 
     def _prefilter_ayclub_results(
         self,
@@ -793,6 +998,7 @@ class SyncHandler:
             movie_transferred = False
             resource_found = False
             ayclub_usable_candidate = False
+            movie_ed2k_dispatched = False
 
             resource_iterator = self._search_handler.iter_resources(
                 mediainfo=mediainfo,
@@ -805,11 +1011,23 @@ class SyncHandler:
                 ),
                 force_refresh=bool(movie_gate.get("force_refresh")),
                 cache_only=bool(movie_gate.get("cache_only")),
+                yield_source_end=True,
             )
 
             for resource in resource_iterator:
-                resource_found = True                
+                if resource.get("_source_end"):
+                    source_name = str(
+                        resource.get("search_source") or ""
+                    ).casefold()
+                    if movie_ed2k_dispatched and source_name == "ayclub":
+                        logger.info(
+                            "AYCLUB ED2K 已提交且本源无可用 115，"
+                            "不再查询后续来源"
+                        )
+                        break
+                    continue
 
+                resource_found = True
                 share_url = resource.get("url", "")
                 resource_title = resource.get("title", "")
                 resource_source = str(
@@ -817,6 +1035,22 @@ class SyncHandler:
                     or resource.get("source")
                     or ""
                 ).lower()
+                if self._is_ed2k_resource(resource):
+                    accepted, _ = self._dispatch_ed2k_resource(
+                        subscribe=subscribe,
+                        media_key=media_key,
+                        resource=resource,
+                        mediainfo=mediainfo,
+                        media_type="movie",
+                        season=None,
+                        episodes=None,
+                    )
+                    if accepted:
+                        movie_ed2k_dispatched = True
+                        movie_transferred = True
+                        if resource_source == "ayclub":
+                            ayclub_usable_candidate = True
+                    continue
 
                 # 检查是否是刚搜索出尚未真正解锁的延期解锁 HDHive 资源
                 if resource.get("need_unlock") and not share_url:
@@ -1330,6 +1564,7 @@ class SyncHandler:
 
             # 成功转存的集数列表
             success_episodes = []
+            ed2k_dispatched_episodes: Set[int] = set()
 
             # 同一部剧同一季度只需成功分类一次；
             # 后续分享复用分类目录。
@@ -1387,6 +1622,13 @@ class SyncHandler:
                     for episode in missing_episodes
                     if episode in source_episode_set
                 ]
+
+                if source != "ayclub" and ed2k_dispatched_episodes:
+                    source_episodes = [
+                        episode
+                        for episode in source_episodes
+                        if episode not in ed2k_dispatched_episodes
+                    ]
 
                 if not source_episodes:
                     logger.info(
@@ -1482,6 +1724,7 @@ class SyncHandler:
                         f"AYCLUB 泄漏探测状态：{ayclub_status}"
                     )
 
+                ed2k_dispatched_this_source: Set[int] = set()
                 if source == "ayclub":
                     p115_results = self._prefilter_ayclub_results(
                         resources=p115_results,
@@ -1489,8 +1732,77 @@ class SyncHandler:
                         season=season,
                     )
 
+                    # 保留 1.8.7：AYCLUB 标题明确观察到的集数，
+                    # 即使 115 分享失效，也允许普通来源继续兜底。
+                    observed_episode_set: Set[int] = set()
+                    source_episode_targets = set(source_episodes)
+                    for observed_resource in p115_results or []:
+                        observed_episode_set.update(
+                            self._resource_episode_set(observed_resource)
+                            & source_episode_targets
+                        )
+
+                    promoted_episodes = sorted(
+                        observed_episode_set - standard_episode_set
+                    )
+                    if promoted_episodes:
+                        standard_episode_set.update(promoted_episodes)
+                        logger.info(
+                            f"AYCLUB 已观察到发布集数 {promoted_episodes}；"
+                            "即使分享无效，也允许后续普通来源兜底"
+                        )
+
+                    ayclub_ed2k_results = [
+                        resource
+                        for resource in p115_results
+                        if self._is_ed2k_resource(resource)
+                    ]
+                    p115_results = [
+                        resource
+                        for resource in p115_results
+                        if not self._is_ed2k_resource(resource)
+                    ]
+
+                    for resource in ayclub_ed2k_results:
+                        explicit_episodes = self._resource_episode_set(resource)
+                        candidate_episodes = [
+                            episode
+                            for episode in source_episodes
+                            if (
+                                not explicit_episodes
+                                or episode in explicit_episodes
+                            )
+                        ]
+                        if not candidate_episodes:
+                            continue
+
+                        accepted, _ = self._dispatch_ed2k_resource(
+                            subscribe=subscribe,
+                            media_key=media_key,
+                            resource=resource,
+                            mediainfo=mediainfo,
+                            media_type="tv",
+                            season=int(season),
+                            episodes=candidate_episodes,
+                        )
+                        if accepted:
+                            ed2k_dispatched_this_source.update(candidate_episodes)
+                            ed2k_dispatched_episodes.update(candidate_episodes)
+
+                    if ed2k_dispatched_this_source:
+                        logger.info(
+                            f"AYCLUB ED2K 已独立提交，覆盖集数："
+                            f"{sorted(ed2k_dispatched_this_source)}；"
+                            "同消息中的 115 仍按原流程继续验证"
+                        )
+
                 if not p115_results:
-                    if source == "ayclub":
+                    if ed2k_dispatched_this_source:
+                        logger.info(
+                            "AYCLUB 本次只有已提交的 ED2K，"
+                            "后续来源仅处理未覆盖缺集"
+                        )
+                    elif source == "ayclub":
                         logger.info("AYCLUB候选均与当前缺集无交集，不再打开115分享")
                     remaining_sources = enabled_sources[source_index + 1:]
                     if remaining_sources:
