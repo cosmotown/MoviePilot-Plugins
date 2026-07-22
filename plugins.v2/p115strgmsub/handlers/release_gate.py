@@ -502,11 +502,13 @@ class ReleaseGateStore:
         tmdb_id: int,
         theatrical_date: Optional[str] = None,
         lifecycle_force_refresh: bool = False,
+        scheduled_evening_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
         判断电影本次 AYCLUB 查询模式。
 
-        普通任务：白天严格只读缓存；晚间窗口到期后真实查询一次。
+        普通任务：白天严格只读缓存；固定晚间窗口或 cron 当天最后一轮
+        到期后按电影发布与退避门禁决定是否真实查询。
         新订阅、重新订阅、MP reset：允许立即强刷。
         """
         state = self.get_movie(tmdb_id)
@@ -624,7 +626,14 @@ class ReleaseGateStore:
                 interval_days=self._movie_search_interval_days(state),
             )
 
-        in_window = self._movie_in_refresh_window()
+        in_window = bool(
+            scheduled_evening_refresh or self._movie_in_refresh_window()
+        )
+        evening_reason = (
+            "scheduled_evening_refresh"
+            if scheduled_evening_refresh
+            else "evening_window"
+        )
 
         if state.get("released"):
             interval_days = self._movie_search_interval_days(state)
@@ -634,7 +643,7 @@ class ReleaseGateStore:
                     state=state,
                     allow_ayclub=True,
                     probe_due=False,
-                    reason="released_search_due_evening",
+                    reason=f"released_search_due_{evening_reason}",
                     force_refresh=True,
                     cache_only=False,
                     real_search_due=True,
@@ -670,7 +679,7 @@ class ReleaseGateStore:
                 state=state,
                 allow_ayclub=True,
                 probe_due=True,
-                reason="unreleased_probe_due_evening",
+                reason=f"unreleased_probe_due_{evening_reason}",
                 force_refresh=True,
                 cache_only=False,
                 real_search_due=True,

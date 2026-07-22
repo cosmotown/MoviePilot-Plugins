@@ -33,6 +33,8 @@ class SyncHandler:
     """同步处理器"""
 
     AYCLUB_DAILY_REFRESH_DATA_KEY = "ayclub_daily_refresh_state"
+    # 保留旧的 22:00-23:59 手动晚间窗口；配置 cron 的最后一轮另由
+    # scheduled_evening_refresh 显式授权，不再依赖这里的固定小时。
     AYCLUB_REFRESH_WINDOW_START_HOUR = 22
     AYCLUB_REFRESH_WINDOW_END_HOUR = 24
     AYCLUB_DAILY_REFRESH_RETENTION_DAYS = 30
@@ -1025,11 +1027,19 @@ class SyncHandler:
         tmdb_id: Optional[int],
         season: int,
         lifecycle_force_refresh: bool,
+        scheduled_evening_refresh: bool = False,
     ) -> tuple[bool, bool, str]:
         """决定本轮 AYCLUB 是真实查询还是严格只读缓存。
 
+        cron 当天最后一轮优先于固定晚间窗口和每日去重；普通手动或
+        生命周期定向同步不会自动获得该标记。
         返回：(force_refresh, cache_only, reason)。
         """
+        if scheduled_evening_refresh and tmdb_id:
+            # 配置 cron 的当天最后一轮必须真实搜索。即使白天曾由新增订阅
+            # 或 reset 做过一次强刷，也不能把最后定时轮次降级为只读缓存。
+            return True, False, "scheduled_evening_refresh"
+
         if lifecycle_force_refresh:
             return True, False, "lifecycle_force_refresh"
 
@@ -1037,7 +1047,8 @@ class SyncHandler:
         if not tmdb_id:
             return False, True, "cache_only_missing_tmdb"
 
-        if not self._ayclub_in_refresh_window(now):
+        in_legacy_evening_window = self._ayclub_in_refresh_window(now)
+        if not scheduled_evening_refresh and not in_legacy_evening_window:
             return False, True, "cache_only_outside_evening_window"
 
         if not self._ayclub_daily_refresh_due(
@@ -1047,7 +1058,7 @@ class SyncHandler:
         ):
             return False, True, "cache_only_already_refreshed_today"
 
-        return True, False, "scheduled_evening_refresh"
+        return True, False, "evening_refresh_window"
 
     def _record_ayclub_query_if_real(
         self,
@@ -1312,7 +1323,8 @@ class SyncHandler:
         subscribe,
         history: List[dict],
         transfer_details: List[Dict[str, Any]],
-        transferred_count: int
+        transferred_count: int,
+        scheduled_evening_refresh: bool = False,
     ) -> int:
         """
         处理单个电影订阅
@@ -1417,6 +1429,7 @@ class SyncHandler:
                     int(mediainfo.tmdb_id),
                     theatrical_date=getattr(mediainfo, "release_date", None),
                     lifecycle_force_refresh=lifecycle_force_refresh,
+                    scheduled_evening_refresh=scheduled_evening_refresh,
                 )
             else:
                 logger.info(
@@ -1718,7 +1731,8 @@ class SyncHandler:
         history: List[dict],
         transfer_details: List[Dict[str, Any]],
         transferred_count: int,
-        exclude_ids: Set[int]
+        exclude_ids: Set[int],
+        scheduled_evening_refresh: bool = False,
     ) -> int:
         """
         处理单个电视剧订阅
@@ -2157,6 +2171,7 @@ class SyncHandler:
                         tmdb_id=getattr(mediainfo, "tmdb_id", None),
                         season=int(season),
                         lifecycle_force_refresh=force_refresh,
+                        scheduled_evening_refresh=scheduled_evening_refresh,
                     )
                     if ayclub_force_refresh:
                         logger.info(

@@ -50,7 +50,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.5"
+    plugin_version = "1.9.6"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -1238,7 +1238,8 @@ class P115StrgmSub(_PluginBase):
                 self._scheduler.add_job(
                     func=self.sync_subscribes,
                     trigger='date',
-                    run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3)
+                    run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=3),
+                    kwargs={"trigger_reason": "manual_once"},
                 )
                 if self._scheduler.get_jobs():
                     self._scheduler.start()
@@ -1609,7 +1610,7 @@ class P115StrgmSub(_PluginBase):
                         timezone=pytz.timezone(settings.TZ),
                     ),
                     "func": self.sync_subscribes,
-                    "kwargs": {}
+                    "kwargs": {"trigger_reason": "scheduled_cron"}
                 })
             except Exception as e:
                 logger.warning(f"Cron 表达式无效：{self._cron}，将回退 interval=8h。错误：{e}")
@@ -1639,6 +1640,7 @@ class P115StrgmSub(_PluginBase):
         self,
         target_subscribe_ids: Optional[List[int]] = None,
         trigger_reason: str = "",
+        scheduled_evening_refresh: bool = False,
     ) -> bool:
         targeted_request = target_subscribe_ids is not None
         target_ids: Set[int] = set()
@@ -1794,7 +1796,8 @@ class P115StrgmSub(_PluginBase):
                 subscribe=subscribe,
                 history=history,
                 transfer_details=transfer_details,
-                transferred_count=transferred_count
+                transferred_count=transferred_count,
+                scheduled_evening_refresh=scheduled_evening_refresh,
             )
 
         # 处理剧集
@@ -1809,7 +1812,8 @@ class P115StrgmSub(_PluginBase):
                 history=history,
                 transfer_details=transfer_details,
                 transferred_count=transferred_count,
-                exclude_ids=exclude_ids
+                exclude_ids=exclude_ids,
+                scheduled_evening_refresh=scheduled_evening_refresh,
             )
 
         if skipped_count:
@@ -1853,12 +1857,23 @@ class P115StrgmSub(_PluginBase):
         with lock:
             tz = pytz.timezone(settings.TZ)
             run_start = datetime.datetime.now(tz=tz)
+            scheduled_evening_refresh = bool(
+                target_subscribe_ids is None
+                and trigger_reason == "scheduled_cron"
+                and self._is_last_run_today(run_start)
+            )
+            if trigger_reason == "scheduled_cron":
+                logger.info(
+                    "定时任务 AYCLUB 刷新权限："
+                    f"{'当日最后一轮真实搜索' if scheduled_evening_refresh else '白天轮次仅缓存'}"
+                )
 
             success = False
             try:
                 success = self._do_sync(
                     target_subscribe_ids=target_subscribe_ids,
                     trigger_reason=trigger_reason,
+                    scheduled_evening_refresh=scheduled_evening_refresh,
                 )
             except Exception as e:
                 logger.error(f"同步任务异常：{e}")

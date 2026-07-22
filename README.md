@@ -1,6 +1,6 @@
 # P115StrgmSub - 115网盘订阅追更插件
 
-当前版本：**1.9.5**
+当前版本：**1.9.6**
 
 MoviePilot v2 插件。根据 MoviePilot 订阅、媒体库正式缺失状态和本地 STRM 实际文件，从 115 分享与 AYCLUB 结构化结果中选择目标资源。115 API 与选择性转存统一交给独立的 p115-openclaw 服务执行；插件不读取 115 Cookie、不安装 `p115client`，也不接管 MoviePilot 后续整理和订阅完成状态。
 
@@ -18,6 +18,10 @@ MoviePilot 订阅
   → MoviePilot 正式缺失检查确认入库
 ```
 
+## 1.9.6 修复
+
+- **定时刷新与 Cron 对齐**：配置 Cron 的每日最后一轮固定执行 AYCLUB 真实搜索，记录原因为 `scheduled_evening_refresh`，并向桥接传递 `cache_only: false`；白天轮次继续严格只读缓存，手动同步和普通生命周期事件不会因此获得强刷权限。
+
 ## 1.9.5 主要变更
 
 - **隔离 115 依赖**：移除 MoviePilot 共享环境中的 `p115client` 依赖，不再读取插件内 115 Cookie，避免影响 P115Disk、P115StrmHelper 等插件。
@@ -34,7 +38,7 @@ MoviePilot 订阅
 ## 版本组件
 
 ```text
-plugins.v2/p115strgmsub/        P115StrgmSub 1.9.5
+plugins.v2/p115strgmsub/        P115StrgmSub 1.9.6
 companion/tg-ayclub-bridge/     AYCLUB Bridge 1.4.3（独立配套项目，不在本次同步范围）
 ```
 
