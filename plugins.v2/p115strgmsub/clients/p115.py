@@ -1,43 +1,34 @@
+"""Isolated 115 transfer client backed by the p115-openclaw sidecar.
+
+This MoviePilot plugin intentionally does not import :mod:`p115client`.
+All 115 API calls run inside the independent ``p115-openclaw`` container so
+P115StrgmSub cannot upgrade or replace the p115client used by P115Disk or
+P115StrmHelper in MoviePilot's shared Python environment.
 """
-115网盘客户端封装
-"""
+from __future__ import annotations
+
 import time
-import threading
-from pathlib import Path
-from functools import wraps
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Tuple, Callable
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import requests
 
 from app.log import logger
-try:
-    from p115client import P115Client, check_response
-    from p115client.util import share_extract_payload
-    from p115client.tool.iterdir import share_iterdir
-    P115_AVAILABLE = True
-except ImportError:
-    P115_AVAILABLE = False
-    logger.warning("p115client 未安装，115网盘功能不可用，请安装: pip install p115client")
 
 
 @dataclass
 class ShareLinkStatus:
-    """
-    分享链接状态信息
-
-    用于表示 115 分享链接的有效性和详细状态
-    """
-    is_valid: bool = False              # 链接是否有效可用
-    is_expired: bool = False            # 链接是否已过期
-    is_cancelled: bool = False          # 链接是否已被取消
-    is_deleted: bool = False            # 分享的文件是否已删除
-    error_code: int = 0                 # 错误码（0 表示无错误）
-    error_message: str = ""             # 错误信息
-    file_count: int = 0                 # 分享中的文件数量
-    share_info: Dict[str, Any] = field(default_factory=dict)  # 分享详情
+    is_valid: bool = False
+    is_expired: bool = False
+    is_cancelled: bool = False
+    is_deleted: bool = False
+    error_code: int = 0
+    error_message: str = ""
+    file_count: int = 0
+    share_info: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def status_text(self) -> str:
-        """获取状态的中文描述"""
         if self.is_valid:
             return "有效"
         if self.is_expired:
@@ -46,904 +37,259 @@ class ShareLinkStatus:
             return "已取消"
         if self.is_deleted:
             return "文件已删除"
-        if self.error_message:
-            return self.error_message
-        return "未知状态"
-
-
-class RateLimiter:
-    """
-    API 请求速率限制器
-    确保请求之间有最小间隔，并添加随机抖动避免触发风控
-    """
-
-    def __init__(self, min_interval: float = 1.5, jitter_ratio: float = 0.3):
-        """
-        :param min_interval: 基础请求间隔（秒），实际间隔会在此基础上随机浮动
-        :param jitter_ratio: 抖动比例，如 0.3 表示 ±30% 的随机浮动
-        """
-        self.min_interval = min_interval
-        self.jitter_ratio = jitter_ratio
-        self.last_request_time = 0.0
-        self._lock = threading.Lock()
-
-    def _get_jittered_interval(self) -> float:
-        """获取带随机抖动的间隔时间"""
-        import random
-        jitter = self.min_interval * self.jitter_ratio
-        return self.min_interval + random.uniform(-jitter, jitter)
-
-    def wait(self):
-        """等待直到可以发起下一次请求（带随机抖动）"""
-        with self._lock:
-            now = time.time()
-            elapsed = now - self.last_request_time
-            target_interval = self._get_jittered_interval()
-            if elapsed < target_interval:
-                sleep_time = target_interval - elapsed
-                time.sleep(sleep_time)
-            self.last_request_time = time.time()
-
-    def acquire(self):
-        """获取请求许可（wait 的别名）"""
-        self.wait()
-
-
-def retry_on_failure(
-    max_retries: int = 3,
-    initial_delay: float = 1.0,
-    backoff_factor: float = 2.0,
-    retryable_exceptions: tuple = (Exception,)
-):
-    """
-    带指数退避的重试装饰器
-
-    :param max_retries: 最大重试次数
-    :param initial_delay: 初始延迟（秒）
-    :param backoff_factor: 退避倍数
-    :param retryable_exceptions: 可重试的异常类型
-    """
-    def decorator(func: Callable):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            delay = initial_delay
-            last_exception = None
-
-            for attempt in range(max_retries + 1):
-                try:
-                    return func(*args, **kwargs)
-                except retryable_exceptions as e:
-                    last_exception = e
-                    if attempt < max_retries:
-                        logger.info(f"请求失败 (尝试 {attempt + 1}/{max_retries + 1}): {e}, {delay:.1f}秒后重试...")
-                        time.sleep(delay)
-                        delay *= backoff_factor
-                    else:
-                        logger.warning(f"请求失败，已达最大重试次数 ({max_retries + 1}): {e}")
-                        raise
-
-            raise last_exception
-        return wrapper
-    return decorator
-
-
-class PathCache:
-    """
-    路径缓存，带 TTL（生存时间）支持
-    """
-
-    def __init__(self, default_ttl: int = 3600):
-        """
-        :param default_ttl: 默认缓存过期时间（秒）
-        """
-        self.default_ttl = default_ttl
-        self._cache: Dict[str, Tuple[int, float]] = {}  # path -> (cid, timestamp)
-        self._lock = threading.Lock()
-
-    def get(self, path: str) -> Optional[int]:
-        """获取缓存的 CID，如果缓存过期则返回 None"""
-        with self._lock:
-            if path not in self._cache:
-                return None
-            cid, timestamp = self._cache[path]
-            if time.time() - timestamp > self.default_ttl:
-                del self._cache[path]
-                return None
-            return cid
-
-    def set(self, path: str, cid: int):
-        """设置缓存"""
-        with self._lock:
-            self._cache[path] = (cid, time.time())
-
-    def invalidate(self, path: str):
-        """使缓存失效"""
-        with self._lock:
-            self._cache.pop(path, None)
-
-    def clear(self):
-        """清空缓存"""
-        with self._lock:
-            self._cache.clear()
-
-    def __contains__(self, path: str) -> bool:
-        return self.get(path) is not None
+        return self.error_message or "未知状态"
 
 
 class P115ClientManager:
-    """115网盘客户端管理器"""
+    """Compatibility facade for the old in-process manager.
 
-    # 默认配置常量
-    DEFAULT_MIN_INTERVAL = 1.5      # API 请求基础间隔（秒），实际会有 ±30% 随机浮动
-    DEFAULT_RECURSION_DELAY = 1.0   # 递归遍历子目录延迟（秒）
-    DEFAULT_PATH_CACHE_TTL = 3600   # 路径缓存过期时间（秒）
-    DEFAULT_MAX_RETRIES = 3         # 最大重试次数
-    DEFAULT_JITTER_RATIO = 0.3      # 请求间隔随机抖动比例（±30%）
+    The public methods deliberately match the former manager so the search and
+    episode-selection logic stays unchanged. The implementation is HTTP-only.
+    """
+
+    CACHE_TTL_SECONDS = 60
 
     def __init__(
         self,
-        cookies: str,
-        user_agent: str = None,
-        min_interval: float = None,
-        recursion_delay: float = None,
-        path_cache_ttl: int = None
+        cookies: str = "",
+        *,
+        base_url: str = "",
+        token: str = "",
+        timeout: int = 120,
+        **_ignored: Any,
     ):
-        """
-        初始化115客户端
-
-        :param cookies: 115 Cookie
-        :param user_agent: User-Agent
-        :param min_interval: API 请求最小间隔（秒），默认 0.5
-        :param recursion_delay: 递归遍历子目录延迟（秒），默认 0.3
-        :param path_cache_ttl: 路径缓存过期时间（秒），默认 3600
-        """
-        # API 调用计数器
+        self.base_url = str(base_url or "").strip().rstrip("/")
+        self.token = str(token or "").strip()
+        self.timeout = max(15, int(timeout or 120))
         self._api_call_count = 0
+        self._inspect_cache: Dict[Tuple[str, int, Optional[int]], Tuple[float, dict]] = {}
+        self._health_cache: Tuple[float, dict] | None = None
+        self._session = requests.Session()
+        self._session.trust_env = False
+        if cookies:
+            logger.info("P115StrgmSub 1.9.5 起不再读取插件 Cookie；115 操作由独立 OpenClaw 后端执行")
 
-        self.cookies = cookies
-        self.user_agent = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        self.client: Optional[Any] = None
+    @property
+    def is_ready(self) -> bool:
+        return bool(self.base_url and self.token)
 
-        # 速率限制
-        _min_interval = min_interval if min_interval is not None else self.DEFAULT_MIN_INTERVAL
-        self.rate_limiter = RateLimiter(min_interval=_min_interval)
+    def _request(self, path: str, *, payload: Optional[dict] = None, method: str = "POST") -> dict:
+        if not self.is_ready:
+            raise RuntimeError("OpenClaw 115 执行服务地址或 Token 未配置")
+        self._api_call_count += 1
+        url = f"{self.base_url}/api/openclaw/{path.lstrip('/')}"
+        response = self._session.request(
+            method,
+            url,
+            headers={
+                "X-OpenClaw-Token": self.token,
+                "Content-Type": "application/json",
+            },
+            json=payload if method.upper() != "GET" else None,
+            timeout=(10, self.timeout),
+        )
+        response.raise_for_status()
+        data = response.json() if response.content else {}
+        if not isinstance(data, dict):
+            raise RuntimeError("OpenClaw 115 执行服务返回格式无效")
+        return data
 
-        # 递归延迟
-        self.recursion_delay = recursion_delay if recursion_delay is not None else self.DEFAULT_RECURSION_DELAY
-
-        # 路径缓存（带 TTL）
-        _path_cache_ttl = path_cache_ttl if path_cache_ttl is not None else self.DEFAULT_PATH_CACHE_TTL
-        self.path_cache = PathCache(default_ttl=_path_cache_ttl)
-        # 根目录始终缓存
-        self.path_cache.set("/", 0)
-
-        # 分享信息缓存（URL -> {share_code, receive_code}）
-        self._share_info_cache: Dict[str, Dict[str, str]] = {}
-
-        if P115_AVAILABLE and cookies:
-            try:
-                self.client = P115Client(cookies, app="web")
-            except Exception as e:
-                logger.error(f"初始化 P115Client 失败: {e}")
-
-    def _rate_limited_call(self, func: Callable, *args, **kwargs):
-        """
-        带速率限制的 API 调用封装
-
-        :param func: 要调用的函数
-        :return: 函数返回值
-        """
-        self.rate_limiter.wait()
-        return func(*args, **kwargs)
+    def _health(self, *, force: bool = False) -> dict:
+        now = time.time()
+        if not force and self._health_cache and now - self._health_cache[0] < 30:
+            return self._health_cache[1]
+        data = self._request("health", method="GET")
+        self._health_cache = (now, data)
+        return data
 
     def check_login(self) -> bool:
-        """检查登录状态"""
-        if not self.client:
+        try:
+            data = self._health(force=True)
+            if int(data.get("selective_transfer_api_version") or 0) < 1:
+                logger.error("p115-openclaw 版本过旧，缺少选择性转存 API；请升级到 1.0.94+")
+                return False
+            if not data.get("connected"):
+                logger.error("p115-openclaw 当前未连接 115 账号")
+                return False
+            return True
+        except Exception as exc:
+            logger.error(f"OpenClaw 115 执行服务自检失败：{type(exc).__name__}: {exc}")
             return False
 
+    def _inspect(
+        self,
+        share_url: str,
+        *,
+        max_depth: int = 3,
+        target_season: Optional[int] = None,
+        force: bool = False,
+    ) -> dict:
+        key = (str(share_url), int(max_depth), int(target_season) if target_season else None)
+        now = time.time()
+        cached = self._inspect_cache.get(key)
+        if not force and cached and now - cached[0] < self.CACHE_TTL_SECONDS:
+            return cached[1]
+        data = self._request(
+            "share/inspect",
+            payload={
+                "source": share_url,
+                "max_depth": max(1, min(int(max_depth), 6)),
+                "target_season": int(target_season) if target_season else None,
+            },
+        )
+        self._inspect_cache[key] = (now, data)
+        return data
+
+    @staticmethod
+    def _status_from_dict(raw: Any) -> ShareLinkStatus:
+        raw = raw if isinstance(raw, dict) else {}
         try:
-            self.rate_limiter.wait()
-            self._api_call_count += 1
-            user_info = self.client.user_my_info()
-            if user_info.get("state"):
-                uname = user_info.get('data', {}).get('uname', '未知')
-                logger.info(f"115 登录成功: {uname}")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"检查 115 登录状态失败: {e}")
-            return False
-
-    def get_pid_by_path(self, path: str, mkdir: bool = True) -> int:
-        """
-        通过文件夹路径获取 CID (Directory ID)
-
-        :param path: 文件夹路径 (例如: /我的接收/电影)
-        :param mkdir: 如果目录不存在，是否创建
-        :return: 文件夹 ID，0 为根目录，-1 为获取失败
-        """
-        if not self.client:
-            return -1
-
-        # 规范化路径
-        path = path.replace("\\", "/")
-        if not path.startswith("/"):
-            path = "/" + path
-        path = path.rstrip("/")
-
-        # 根目录
-        if not path or path == "/":
-            return 0
-
-        # 尝试从缓存获取
-        cached_cid = self.path_cache.get(path)
-        if cached_cid is not None:
-            return cached_cid
-
-        # 尝试直接通过 API 获取完整路径
+            error_code = int(raw.get("error_code") or 0)
+        except (TypeError, ValueError):
+            error_code = -1
         try:
-            self.rate_limiter.wait()
-            self._api_call_count += 1
-            resp = self.client.fs_dir_getid(path)
-            if resp.get("id"):
-                cid = int(resp["id"])
-                self.path_cache.set(path, cid)
-                return cid
-        except Exception as e:
-            logger.info(f"直接获取路径 ID 失败 ({path}): {e}")
-
-        # 如果不创建，则返回失败
-        if not mkdir:
-            return -1
-
-        # ===== 优化：创建模式下直接逐级创建，不再每层都先尝试获取 =====
-        parts = [p for p in path.split("/") if p]
-        parent_id = 0
-        current_path = ""
-        start_index = 0
-
-        # 找到最近的已缓存父目录
-        temp_path = ""
-        for i, part in enumerate(parts):
-            temp_path = f"{temp_path}/{part}"
-            temp_cid = self.path_cache.get(temp_path)
-            if temp_cid is not None:
-                parent_id = temp_cid
-                current_path = temp_path
-                start_index = i + 1
-
-        # 从未缓存的部分开始处理（优化：直接创建，不再先获取）
-        for i in range(start_index, len(parts)):
-            part = parts[i]
-            current_path = f"{current_path}/{part}"
-
-            # 再次检查缓存（可能在并发中被设置）
-            cached = self.path_cache.get(current_path)
-            if cached is not None:
-                parent_id = cached
-                continue
-
-            # 直接创建目录（fs_makedirs_app 会自动处理已存在的情况）
-            try:
-                self.rate_limiter.wait()
-                self._api_call_count += 1
-                resp = self.client.fs_makedirs_app(part, pid=parent_id)
-                check_response(resp)
-                if resp.get("state"):
-                    cid = int(resp["cid"])
-                    self.path_cache.set(current_path, cid)
-                    parent_id = cid
-                    logger.info(f"创建目录成功: {current_path} -> {cid}")
-                elif resp.get("errno") == 20004 or "已存在" in resp.get("error", ""):
-                    # 目录已存在，尝试获取其 ID
-                    try:
-                        self.rate_limiter.wait()
-                        self._api_call_count += 1
-                        get_resp = self.client.fs_dir_getid(current_path)
-                        if get_resp.get("id"):
-                            cid = int(get_resp["id"])
-                            self.path_cache.set(current_path, cid)
-                            parent_id = cid
-                            continue
-                    except Exception:
-                        pass
-                    logger.error(f"目录已存在但无法获取ID: {current_path}")
-                    return -1
-                else:
-                    logger.error(f"创建目录失败 {current_path}: {resp.get('error')}")
-                    return -1
-            except Exception as e:
-                logger.error(f"创建目录异常 {current_path}: {e}")
-                return -1
-
-        return parent_id
-
-    def extract_share_info(self, url: str) -> Dict[str, str]:
-        """
-        解析分享链接，获取 share_code 和 receive_code（带缓存）
-
-        :param url: 115 分享链接
-        :return: {"share_code": ..., "receive_code": ...}
-        """
-        if not P115_AVAILABLE:
-            return {}
-
-        # 检查缓存
-        if url in self._share_info_cache:
-            return self._share_info_cache[url]
-
-        try:
-            payload = share_extract_payload(url)
-            result = {
-                "share_code": payload.get("share_code", ""),
-                "receive_code": payload.get("receive_code", "")
-            }
-            # 缓存结果
-            self._share_info_cache[url] = result
-            return result
-        except Exception as e:
-            logger.error(f"解析分享链接失败: {e}")
-            return {}
+            file_count = int(raw.get("file_count") or 0)
+        except (TypeError, ValueError):
+            file_count = 0
+        return ShareLinkStatus(
+            is_valid=bool(raw.get("is_valid")),
+            is_expired=bool(raw.get("is_expired")),
+            is_cancelled=bool(raw.get("is_cancelled")),
+            is_deleted=bool(raw.get("is_deleted")),
+            error_code=error_code,
+            error_message=str(raw.get("error_message") or ""),
+            file_count=file_count,
+            share_info=dict(raw.get("share_info") or {}),
+        )
 
     def check_share_status(self, share_url: str) -> ShareLinkStatus:
-        """
-        检查分享链接的状态（是否有效、过期、失效等）
-
-        :param share_url: 115 分享链接
-        :return: ShareLinkStatus 对象，包含详细的状态信息
-        """
-        # 默认返回无效状态
-        status = ShareLinkStatus()
-
-        if not self.client:
-            status.error_message = "客户端未初始化"
-            return status
-
-        # 解析分享链接
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
-
-        if not share_code:
-            status.error_message = "无效的分享链接格式"
-            return status
-
         try:
-            # 使用 share_snap 接口检查分享状态
-            self.rate_limiter.wait()
-            self._api_call_count += 1
-            payload = {
-                "share_code": share_code,
-                "receive_code": receive_code or "",
-                "cid": 0,
-                "limit": 1,  # 只获取1条记录，用于验证
-                "offset": 0,
-            }
-            resp = self.client.share_snap(payload)
-
-            # 检查响应状态
-            state = resp.get("state")
-
-            if state is True or state == 1:
-                # 分享有效
-                status.is_valid = True
-                status.error_code = 0
-
-                # 获取分享信息
-                data = resp.get("data", {})
-                share_info = data.get("shareinfo", {})
-                file_list = data.get("list", [])
-
-                status.file_count = int(data.get("count", len(file_list)))
-                status.share_info = {
-                    "share_title": share_info.get("share_title", ""),
-                    "share_state": share_info.get("share_state", ""),
-                    "file_count": status.file_count,
-                    "create_time": share_info.get("create_time", ""),
-                    "expire_time": share_info.get("expire_time", ""),
-                    "user_name": share_info.get("user_name", ""),
-                }
-            else:
-                # 分享无效，解析错误信息
-                status.is_valid = False
-                status.error_code = resp.get("errno", resp.get("errcode", -1))
-                status.error_message = resp.get("error", resp.get("message", "未知错误"))
-
-                # 根据错误码判断具体原因
-                error_msg_lower = status.error_message.lower()
-                error_msg = status.error_message
-
-                # 判断是否过期
-                if "过期" in error_msg or "expired" in error_msg_lower:
-                    status.is_expired = True
-
-                # 判断是否取消
-                if "取消" in error_msg or "cancel" in error_msg_lower:
-                    status.is_cancelled = True
-
-                # 判断是否删除
-                if "删除" in error_msg or "不存在" in error_msg or "delete" in error_msg_lower:
-                    status.is_deleted = True
-
-                logger.info(f"分享链接无效: {status.error_message} (errno: {status.error_code})")
-
-        except Exception as e:
-            status.error_message = f"检查分享状态异常: {str(e)}"
-            logger.error(status.error_message)
-
-        return status
+            data = self._inspect(share_url, max_depth=1)
+            return self._status_from_dict(data.get("status"))
+        except Exception as exc:
+            return ShareLinkStatus(
+                error_code=-1,
+                error_message=f"OpenClaw 分享检查失败: {type(exc).__name__}",
+            )
 
     def is_share_valid(self, share_url: str) -> bool:
-        """
-        快速检查分享链接是否有效
-
-        :param share_url: 115 分享链接
-        :return: True 表示有效，False 表示无效或失效
-        """
-        status = self.check_share_status(share_url)
-        return status.is_valid
+        return self.check_share_status(share_url).is_valid
 
     def list_share_files(
-            self,
-            share_url: str,
-            cid: int = 0,
-            max_depth: int = 3,
-            target_season: int = None
+        self,
+        share_url: str,
+        cid: int = 0,
+        max_depth: int = 3,
+        target_season: Optional[int] = None,
     ) -> List[dict]:
-        """
-        列出分享链接内的文件
-
-        :param share_url: 115 分享链接
-        :param cid: 目录 ID，0 为根目录
-        :param max_depth: 最大递归深度
-        :param target_season: 目标季数，用于优化递归（跳过明显不匹配的目录）
-        :return: 文件列表
-        """
-        if not self.client:
-            return []
-
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
-
-        if not share_code or not receive_code:
-            logger.error("无效的分享链接或解析失败")
-            return []
-
-        return self._list_share_files_recursive(
-            share_code=share_code,
-            receive_code=receive_code,
-            cid=cid,
-            depth=1,
-            max_depth=max_depth,
-            target_season=target_season
-        )
-
-    def _list_share_files_recursive(
-            self,
-            share_code: str,
-            receive_code: str,
-            cid: int = 0,
-            depth: int = 1,
-            max_depth: int = 3,
-            target_season: int = None
-    ) -> List[dict]:
-        """递归列出分享文件（带速率限制和季数过滤优化）"""
-        if depth > max_depth:
-            return []
-
-        files = []
+        if cid not in (0, None):
+            logger.warning("远程 115 管理器不支持从任意分享 CID 开始遍历，改为读取分享根目录")
         try:
-            # 速率限制
-            self.rate_limiter.wait()
-            self._api_call_count += 1
-
-            iterator = share_iterdir(
-                self.client,
-                share_code=share_code,
-                receive_code=receive_code,
-                cid=cid,
-                app="web",
+            data = self._inspect(
+                share_url,
+                max_depth=max_depth,
+                target_season=target_season,
             )
+            status = self._status_from_dict(data.get("status"))
+            if not status.is_valid:
+                return []
+            files = data.get("files") or []
+            return files if isinstance(files, list) else []
+        except Exception as exc:
+            logger.error(f"通过 OpenClaw 列出分享文件失败：{type(exc).__name__}: {exc}")
+            return []
 
-            for item in iterator:
-                file_info = {
-                    "id": str(item.get("id", "")),
-                    "name": item.get("name", ""),
-                    "size": item.get("size", 0),
-                    "is_dir": item.get("is_dir", False),
-                    "sha1": item.get("sha1", ""),
-                    "pick_code": item.get("pick_code", ""),
-                }
-
-                # 递归获取子目录内容（带随机延迟）
-                if file_info["is_dir"] and depth < max_depth:
-                    dir_name = file_info["name"]
-
-                    # 优化：如果指定了目标季数，跳过明显不匹配的季目录
-                    if target_season is not None:
-                        skip_dir = self._should_skip_season_dir(dir_name, target_season)
-                        if skip_dir:
-                            logger.info(f"跳过非目标季目录: {dir_name} (目标: S{target_season})")
-                            files.append(file_info)  # 仍然记录目录信息，但不递归
-                            continue
-
-                    # 递归前增加随机延迟，避免频繁请求
-                    if self.recursion_delay > 0:
-                        import random
-                        jitter = self.recursion_delay * 0.3  # ±30% 随机浮动
-                        delay = self.recursion_delay + random.uniform(-jitter, jitter)
-                        time.sleep(delay)
-
-                    sub_cid = int(item.get("id", 0))
-                    children = self._list_share_files_recursive(
-                        share_code=share_code,
-                        receive_code=receive_code,
-                        cid=sub_cid,
-                        depth=depth + 1,
-                        max_depth=max_depth,
-                        target_season=target_season
-                    )
-                    file_info["children"] = children
-
-                files.append(file_info)
-
-        except Exception as e:
-            logger.error(f"列出分享文件失败: {e}")
-
-        return files
-
-    def _should_skip_season_dir(self, dir_name: str, target_season: int) -> bool:
-        """
-        判断是否应该跳过该目录（明显是其他季的目录）
-
-        :param dir_name: 目录名
-        :param target_season: 目标季数
-        :return: True 表示应跳过，False 表示需要递归
-        """
-        import re
-
-        # 常见的季数目录命名模式
-        patterns = [
-            r'[Ss]eason\s*(\d+)',      # Season 1, season1
-            r'[Ss](\d+)',              # S1, s01
-            r'第(\d+)季',              # 第1季
-            r'第([一二三四五六七八九十]+)季',  # 第一季
-        ]
-
-        # 中文数字映射
-        cn_num_map = {'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
-                      '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
-
-        for pattern in patterns:
-            match = re.search(pattern, dir_name)
-            if match:
-                season_str = match.group(1)
-                # 转换中文数字
-                if season_str in cn_num_map:
-                    found_season = cn_num_map[season_str]
-                else:
-                    try:
-                        found_season = int(season_str)
-                    except ValueError:
-                        continue
-
-                # 如果目录明确是其他季，跳过
-                if found_season != target_season:
-                    return True
-                else:
-                    # 明确是目标季，不跳过
-                    return False
-
-        # 目录名没有明显的季数标识，不跳过（可能包含多季或其他内容）
-        return False
+    @staticmethod
+    def _collect_top_ids(items: Iterable[dict]) -> List[str]:
+        result: List[str] = []
+        for item in items or []:
+            item_id = str((item or {}).get("id") or "").strip()
+            if item_id and item_id not in result:
+                result.append(item_id)
+        return result
 
     def transfer_share(self, share_url: str, save_path: str) -> bool:
-        """
-        转存整个分享链接到指定目录
-
-        :param share_url: 115 分享链接
-        :param save_path: 保存路径
-        :return: 是否成功
-        """
-        if not self.client:
+        files = self.list_share_files(share_url, max_depth=1)
+        file_ids = self._collect_top_ids(files)
+        if not file_ids:
             return False
-
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
-
-        if not share_code or not receive_code:
-            logger.error("无效的分享链接或解析失败")
-            return False
-
-        # 获取目标目录 CID
-        parent_id = self.get_pid_by_path(save_path, mkdir=True)
-        if parent_id == -1:
-            logger.error(f"无法获取或创建目标目录: {save_path}")
-            return False
-
-        logger.info(f"转存分享到目录 ID: {parent_id} ({save_path})")
-
-        # 执行转存 (file_id=0 表示转存所有内容)
-        return self._do_transfer(
-            share_code=share_code,
-            receive_code=receive_code,
-            file_id="0",
-            parent_id=parent_id,
-            save_path=save_path
+        success_ids, failed_ids = self.transfer_files_batch(
+            share_url=share_url,
+            file_ids=file_ids,
+            save_path=save_path,
+            batch_size=20,
         )
+        return bool(success_ids) and not failed_ids
 
-    def transfer_file(
-            self,
-            share_url: str,
-            file_id: str,
-            save_path: str
-    ) -> bool:
-        """
-        转存分享中的单个文件
-
-        :param share_url: 115 分享链接
-        :param file_id: 文件 ID
-        :param save_path: 保存路径
-        :return: 是否成功
-        """
-        if not self.client:
-            return False
-
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
-
-        if not share_code or not receive_code:
-            logger.error("无效的分享链接或解析失败")
-            return False
-
-        # 获取目标目录 CID
-        parent_id = self.get_pid_by_path(save_path, mkdir=True)
-        if parent_id == -1:
-            logger.error(f"无法获取或创建目标目录: {save_path}")
-            return False
-
-        # 执行单文件转存
-        return self._do_transfer(
-            share_code=share_code,
-            receive_code=receive_code,
-            file_id=file_id,
-            parent_id=parent_id,
-            save_path=save_path
+    def transfer_file(self, share_url: str, file_id: str, save_path: str) -> bool:
+        success_ids, failed_ids = self.transfer_files_batch(
+            share_url=share_url,
+            file_ids=[str(file_id)],
+            save_path=save_path,
+            batch_size=1,
         )
+        return bool(success_ids) and not failed_ids
 
     def transfer_files_batch(
-            self,
-            share_url: str,
-            file_ids: List[str],
-            save_path: str,
-            batch_size: int = 20,
-            batch_interval: float = 3.0
+        self,
+        share_url: str,
+        file_ids: List[str],
+        save_path: str,
+        batch_size: int = 20,
+        batch_interval: float = 3.0,
     ) -> Tuple[List[str], List[str]]:
-        """
-        批量转存分享中的多个文件，减少 API 调用次数以避免风控
-
-        :param share_url: 115 分享链接
-        :param file_ids: 文件 ID 列表
-        :param save_path: 保存路径
-        :param batch_size: 每批转存的文件数量，默认 20
-        :param batch_interval: 批次之间的间隔时间（秒），默认 3 秒
-        :return: (成功的 file_ids 列表, 失败的 file_ids 列表)
-        """
-        success_ids: List[str] = []
-        failed_ids: List[str] = []
-        batch_size = int(batch_size)
-
-        if not self.client:
-            return success_ids, file_ids
-
-        if not file_ids:
-            return success_ids, failed_ids
-
-        info = self.extract_share_info(share_url)
-        share_code = info.get("share_code")
-        receive_code = info.get("receive_code")
-
-        if not share_code or not receive_code:
-            logger.error("无效的分享链接或解析失败")
-            return success_ids, file_ids
-
-        # 获取目标目录 CID（只需获取一次）
-        parent_id = self.get_pid_by_path(save_path, mkdir=True)
-        if parent_id == -1:
-            logger.error(f"无法获取或创建目标目录: {save_path}")
-            return success_ids, file_ids
-
-        total_batches = (len(file_ids) + batch_size - 1) // batch_size
-        logger.info(f"批量转存: 共 {len(file_ids)} 个文件，分 {total_batches} 批处理（每批 {batch_size} 个）")
-
-        # 分批处理
-        for batch_index in range(0, len(file_ids), batch_size):
-            batch = file_ids[batch_index:batch_index + batch_size]
-            batch_num = batch_index // batch_size + 1
-
-            # 使用逗号分隔多个文件 ID
-            file_id_str = ",".join(batch)
-
-            logger.info(f"处理第 {batch_num}/{total_batches} 批，包含 {len(batch)} 个文件")
-
-            success = self._do_transfer(
-                share_code=share_code,
-                receive_code=receive_code,
-                file_id=file_id_str,
-                parent_id=parent_id,
-                save_path=save_path
-            )
-
-            if success:
-                success_ids.extend(batch)
-                logger.info(f"第 {batch_num} 批转存成功")
-            else:
-                # 批量失败时，尝试逐个转存以确定哪些失败
-                logger.warning(f"第 {batch_num} 批批量转存失败，尝试逐个转存...")
-                for fid in batch:
-                    single_success = self._do_transfer(
-                        share_code=share_code,
-                        receive_code=receive_code,
-                        file_id=fid,
-                        parent_id=parent_id,
-                        save_path=save_path
-                    )
-                    if single_success:
-                        success_ids.append(fid)
-                    else:
-                        failed_ids.append(fid)
-
-            # 批次之间添加间隔，避免触发风控
-            if batch_index + batch_size < len(file_ids):
-                import random
-                jitter = batch_interval * 0.3
-                actual_interval = batch_interval + random.uniform(-jitter, jitter)
-                logger.info(f"批次间隔 {actual_interval:.1f} 秒")
-                time.sleep(actual_interval)
-
-        logger.info(f"批量转存完成: 成功 {len(success_ids)} 个，失败 {len(failed_ids)} 个")
-        return success_ids, failed_ids
-
-    def _do_transfer(
-            self,
-            share_code: str,
-            receive_code: str,
-            file_id: str,
-            parent_id: int,
-            save_path: str,
-            max_retries: int = None
-    ) -> bool:
-        """
-        执行实际转存操作（带重试）
-
-        :param share_code: 分享码
-        :param receive_code: 接收码
-        :param file_id: 文件ID，"0" 表示转存全部
-        :param parent_id: 目标目录 ID
-        :param save_path: 保存路径（用于日志）
-        :param max_retries: 最大重试次数
-        :return: 是否成功
-        """
-        if max_retries is None:
-            max_retries = self.DEFAULT_MAX_RETRIES
-
-        payload = {
-            "share_code": share_code,
-            "receive_code": receive_code,
-            "file_id": file_id,
-            "cid": parent_id,
-            "is_check": 0,
-        }
-
-        last_error = None
-        for attempt in range(max_retries + 1):
-            try:
-                self.rate_limiter.wait()
-                self._api_call_count += 1
-                resp = self.client.share_receive(payload)
-
-                if resp.get("state"):
-                    if file_id == "0":
-                        logger.info(f"转存成功！已保存到: {save_path}")
-                    else:
-                        logger.info(f"文件转存成功！文件ID: {file_id}, 保存到: {save_path}")
-                    return True
-                else:
-                    error_msg = resp.get("error", "未知错误")
-                    error_code = resp.get("errno", resp.get("errcode", 0))
-
-                    # 检查是否是重复文件
-                    if "重复" in error_msg or "已存在" in error_msg:
-                        logger.info(f"文件已存在，跳过: {file_id}")
-                        return True
-
-                    # 检查是否是可重试的错误（如限流）
-                    if error_code in (990001, 990002, 990009):  # 常见的限流错误码
-                        if attempt < max_retries:
-                            wait_time = (attempt + 1) * 2  # 递增等待时间
-                            logger.warning(f"遇到限流，{wait_time}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
-                            time.sleep(wait_time)
-                            continue
-
-                    logger.error(f"转存失败: {error_msg} (错误码: {error_code})")
-                    return False
-
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries:
-                    wait_time = (attempt + 1) * 1.5
-                    logger.warning(f"转存异常: {e}, {wait_time:.1f}秒后重试 (尝试 {attempt + 1}/{max_retries + 1})")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"转存过程中发生异常: {e}")
-                    return False
-
-        return False
-
-    def list_files(self, path: str) -> List[dict]:
-        """
-        列出指定路径下的文件
-
-        :param path: 目录路径
-        :return: 文件列表
-        """
-        if not self.client:
-            return []
-
-        cid = self.get_pid_by_path(path, mkdir=False)
-        if cid == -1:
-            return []
-
+        del batch_interval  # Backend queue owns pacing/rate limiting.
+        normalized: List[str] = []
+        for value in file_ids or []:
+            item_id = str(value or "").strip()
+            if item_id and item_id not in normalized:
+                normalized.append(item_id)
+        if not normalized:
+            return [], []
         try:
-            self.rate_limiter.wait()
-            self._api_call_count += 1
-            resp = self.client.fs_files({"cid": cid, "limit": 1000})
-            if resp.get("state"):
-                return resp.get("data", [])
-            return []
-        except Exception as e:
-            logger.error(f"列出文件失败: {e}")
-            return []
+            data = self._request(
+                "share/transfer-selected",
+                payload={
+                    "source": share_url,
+                    "file_ids": normalized,
+                    "target_dir": save_path,
+                    "batch_size": max(1, min(int(batch_size or 20), 100)),
+                },
+            )
+            success_ids = [str(value) for value in data.get("success_ids") or []]
+            failed_ids = [str(value) for value in data.get("failed_ids") or []]
+            self.clear_share_cache()
+            return success_ids, failed_ids
+        except Exception as exc:
+            logger.error(f"OpenClaw 选择性转存失败：{type(exc).__name__}: {exc}")
+            return [], normalized
 
     def list_directories(self, path: str) -> List[dict]:
-        """
-        列出指定路径下的所有目录（不包含文件）
-
-        :param path: 目录路径
-        :return: 目录列表，每个目录包含 name 和 path 字段
-        """
-        files = self.list_files(path)
-
-        # 过滤出目录（fid=0 表示目录）
-        directories = []
-        for f in files:
-            if f.get("fid") == 0:  # 是目录
-                dir_name = f.get("name", "")
-                dir_path = f"{path.rstrip('/')}/{dir_name}" if path != "/" else f"/{dir_name}"
-                directories.append({
-                    "name": dir_name,
-                    "path": dir_path,
-                    "cid": f.get("cid", 0)
-                })
-
-        return directories
+        """Expose only the fixed dispatch root/categories, never arbitrary 115 paths."""
+        try:
+            health = self._health()
+        except Exception:
+            return []
+        root = str(health.get("root_dir") or "mp整理").strip("/\\") or "mp整理"
+        categories = [str(value) for value in health.get("categories") or []]
+        normalized = "/" + str(path or "/").strip("/\\") if str(path or "/").strip("/\\") else "/"
+        if normalized == "/":
+            return [{"name": root, "path": f"/{root}", "cid": 0}]
+        if normalized == f"/{root}":
+            return [
+                {"name": category, "path": f"/{root}/{category}", "cid": 0}
+                for category in categories
+            ]
+        return []
 
     def clear_path_cache(self):
-        """清空路径缓存"""
-        self.path_cache.clear()
-        self.path_cache.set("/", 0)
+        self._health_cache = None
 
     def clear_share_cache(self):
-        """清空分享信息缓存"""
-        self._share_info_cache.clear()
+        self._inspect_cache.clear()
 
     def get_api_call_count(self) -> int:
-        """获取 API 调用次数"""
         return self._api_call_count
 
     def reset_api_call_count(self):
-        """重置 API 调用计数器"""
         self._api_call_count = 0

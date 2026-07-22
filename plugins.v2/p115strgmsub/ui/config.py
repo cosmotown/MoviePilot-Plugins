@@ -181,23 +181,21 @@ class UIConfig:
                             'content': [{
                                 'component': 'VAlert',
                                 'props': {
-                                    'type': 'warning',
+                                    'type': 'info',
                                     'variant': 'tonal',
-                                    'text': '115网盘配置：请从浏览器获取Cookie（包含UID、CID、SEID、KID等字段）'
+                                    'text': '115 操作已隔离到独立 p115-openclaw 容器。本插件不读取 Cookie、不安装 p115client，也不会影响 P115Disk/P115StrmHelper 的共享依赖。'
                                 }
                             }]
                         }]
                     },
-                    # 转存目录 + 115 Cookie
+                    # 只显示投递根目录；实际分类目标由 OpenClaw 后端强制限定
                     {
                         'component': 'VRow',
                         'content': [
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                             'content': [{'component': 'VTextField', 'props': {'model': 'save_path', 'label': '电视剧转存目录', 'placeholder': '/我的接收/MoviePilot/TV'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                             'content': [{'component': 'VTextField', 'props': {'model': 'movie_save_path', 'label': '电影转存目录', 'placeholder': '/我的接收/MoviePilot/Movie'}}]},
-                            {'component': 'VCol', 'props': {'cols': 12, 'md': 4},
-                             'content': [{'component': 'VTextField', 'props': {'model': 'cookies', 'label': '115 Cookie', 'type': 'password', 'placeholder': 'UID=xxx; CID=xxx; SEID=xxx'}}]}
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'save_path', 'label': '电视剧兼容目录（只读回退已禁用）', 'placeholder': '/mp整理/电视剧', 'readonly': True}}]},
+                            {'component': 'VCol', 'props': {'cols': 12, 'md': 6},
+                             'content': [{'component': 'VTextField', 'props': {'model': 'movie_save_path', 'label': '电影兼容目录（只读回退已禁用）', 'placeholder': '/mp整理/电影', 'readonly': True}}]}
                         ]
                     },
                     # OpenClaw 七分类服务配置
@@ -222,7 +220,7 @@ class UIConfig:
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'classifier_url',
-                                        'label': 'OpenClaw 分类服务地址',
+                                        'label': 'OpenClaw 115 执行服务地址',
                                         'placeholder': 'http://HOST_IP:11591'
                                     }
                                 }]
@@ -234,7 +232,7 @@ class UIConfig:
                                     'component': 'VTextField',
                                     'props': {
                                         'model': 'classifier_token',
-                                        'label': 'OpenClaw 分类服务 Token',
+                                        'label': 'OpenClaw 115 执行服务 Token',
                                         'type': 'password',
                                         'placeholder': '请填写桥接服务 Token',
                                         'clearable': True
@@ -563,8 +561,8 @@ class UIConfig:
             "system_subscribe_window_hours": 1,
             "unblock_delay_minutes": 5,
 
-            "save_path": "/我的接收/MoviePilot/TV",
-            "movie_save_path": "/我的接收/MoviePilot/Movie",
+            "save_path": "/mp整理/电视剧",
+            "movie_save_path": "/mp整理/电影",
             "cookies": "",
             
             # OpenClaw 七分类服务

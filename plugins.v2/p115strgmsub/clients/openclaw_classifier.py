@@ -18,6 +18,8 @@ class OpenClawClassifierClient:
     MOVIE_CATEGORIES = {
         "电影",
         "特摄剧场版",
+        "原盘电影",
+        "原盘动画电影",
     }
 
     TV_CATEGORIES = {
@@ -76,6 +78,7 @@ class OpenClawClassifierClient:
         season: Optional[int] = None,
         episodes: Optional[Iterable[int]] = None,
         resource_title: str = "",
+        request_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         """
         把原始 ED2K 交给 OpenClaw/p115 后端执行。
@@ -131,52 +134,120 @@ class OpenClawClassifierClient:
                     "source": source_url,
                     "execute": True,
                     "hint": "\n".join(hints),
+                    "contract_version": 2,
+                    "request_id": str(request_id or source_ref),
+                    "media_type": str(media_type or "").strip().casefold(),
+                    "title": str(title or "").strip(),
+                    "year": int(year) if year else None,
+                    "tmdb_id": int(tmdb_id) if tmdb_id else None,
+                    "season": int(season) if season is not None else None,
+                    "episodes": sorted(normalized_episodes),
+                    "resource_title": str(resource_title or "")[:1000],
                 },
                 timeout=(10, self.timeout),
             )
             response.raise_for_status()
             data = response.json() if response.content else {}
         except Exception as exc:
+            response_obj = getattr(exc, "response", None)
+            status_code = getattr(response_obj, "status_code", None)
+            suffix = f"，HTTP={status_code}" if status_code is not None else ""
             logger.error(
                 f"OpenClaw ED2K 提交失败：ref={source_ref}，"
-                f"错误类型={type(exc).__name__}"
+                f"错误类型={type(exc).__name__}{suffix}"
             )
             return None
 
-        if isinstance(data, dict) and data.get("ok") is False:
+        if not isinstance(data, dict) or data.get("ok") is False:
             # 不输出后端 message/error，防止其回显原始 ED2K。
             logger.warning(f"OpenClaw 拒绝 ED2K：ref={source_ref}")
             return None
 
-        items = data.get("items") if isinstance(data, dict) else None
-        accepted_item: Dict[str, Any] = {}
-        if isinstance(items, list) and items:
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                status = str(item.get("status") or "").strip().casefold()
-                if status not in {"error", "failed", "rejected"}:
-                    accepted_item = item
-                    break
-            if not accepted_item:
-                logger.warning(f"OpenClaw ED2K 未被接受：ref={source_ref}")
-                return None
+        # Contract v2 is mandatory. A generic HTTP 2xx or legacy
+        # ``already_queued`` response is not enough to create pending state.
+        accepted_statuses = {
+            "queued",
+            "started",
+            "processing",
+            "downloading",
+            "already-queued",
+            "already_queued",
+        }
 
-        raw_status = str(
-            accepted_item.get("status")
-            or (data.get("status") if isinstance(data, dict) else "")
-            or "accepted"
-        ).strip().casefold()
-        status = (
-            raw_status
-            if raw_status in {
-                "accepted", "queued", "submitted", "processing",
-                "downloading", "started", "ok", "success", "duplicate",
-            }
-            else "accepted"
+        def iter_status_objects(value):
+            if isinstance(value, dict):
+                yield value
+                for key in ("items", "result", "data", "job", "task", "payload"):
+                    child = value.get(key)
+                    if isinstance(child, list):
+                        for item in child:
+                            yield from iter_status_objects(item)
+                    elif isinstance(child, dict):
+                        yield from iter_status_objects(child)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from iter_status_objects(item)
+
+        expected_request_id = str(request_id or source_ref)
+        expected_episodes = sorted(normalized_episodes)
+        accepted_item = None
+        observed_statuses = []
+        for item in iter_status_objects(data):
+            status = str(item.get("status") or "").strip().casefold()
+            if status and status not in observed_statuses:
+                observed_statuses.append(status)
+            if status not in accepted_statuses:
+                continue
+            try:
+                contract_version = int(item.get("contract_version") or 0)
+            except (TypeError, ValueError):
+                contract_version = 0
+            echoed_episodes = []
+            for value in item.get("expected_episodes") or []:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if episode > 0 and episode not in echoed_episodes:
+                    echoed_episodes.append(episode)
+            echoed_episodes.sort()
+            echoed_season = item.get("expected_season")
+            try:
+                echoed_season = int(echoed_season) if echoed_season is not None else None
+            except (TypeError, ValueError):
+                echoed_season = None
+
+            if (
+                contract_version == 2
+                and item.get("verified") is True
+                and str(item.get("request_id") or "") == expected_request_id
+                and echoed_episodes == expected_episodes
+                and echoed_season == (int(season) if season is not None else None)
+            ):
+                accepted_item = item
+                break
+
+        if not accepted_item:
+            safe_statuses = ",".join(observed_statuses[:8]) or "none"
+            logger.warning(
+                f"OpenClaw ED2K 响应未通过 contract v2 回显校验，拒绝登记在途："
+                f"ref={source_ref}，statuses={safe_statuses}"
+            )
+            return None
+
+        explicit_status = str(accepted_item.get("status") or "").strip().casefold()
+        logger.info(
+            f"OpenClaw contract v2 已确认活动 ED2K 任务："
+            f"ref={source_ref}，status={explicit_status}"
         )
-        logger.info(f"OpenClaw 已接受 ED2K：ref={source_ref}，status={status}")
-        return {"ok": True, "status": status}
+        return {
+            "ok": True,
+            "status": explicit_status,
+            "contract_version": 2,
+            "job_id": str(accepted_item.get("job_id") or ""),
+            "request_id": expected_request_id,
+        }
+
 
     def inspect_share(
         self,
@@ -273,12 +344,21 @@ class OpenClawClassifierClient:
             )
             return None
 
-        target_dir = str(item.get("target_dir") or "").strip()
-        if not target_dir:
-            logger.warning("OpenClaw 分类结果缺少 target_dir")
+        target_dir = str(item.get("target_dir") or "").strip().replace("\\", "/")
+        parts = [part for part in target_dir.strip("/").split("/") if part]
+        all_categories = self.MOVIE_CATEGORIES | self.TV_CATEGORIES
+        if (
+            len(parts) < 2
+            or parts[0] != "mp整理"
+            or parts[1] not in all_categories
+            or any(part in {".", ".."} for part in parts)
+        ):
+            logger.warning(
+                f"OpenClaw 分类结果越界，拒绝转存：target={target_dir!r}"
+            )
             return None
 
-        item["target_dir"] = "/" + target_dir.strip("/")
+        item["target_dir"] = "/" + "/".join(parts)
 
         logger.info(
             f"OpenClaw 分类完成："

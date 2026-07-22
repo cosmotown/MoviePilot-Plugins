@@ -50,7 +50,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.8.8"
+    plugin_version = "1.9.5"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -822,68 +822,6 @@ class P115StrgmSub(_PluginBase):
         except Exception as error:
             logger.warning(f"安排生命周期联动同步失败：{error}")
 
-    def _schedule_transfer_reconcile(
-        self,
-        media_key: str,
-        *,
-        success: bool,
-        delay_seconds: int = 60,
-    ):
-        """合并同一媒体连续入库事件，避免逐集刷新 MP 和触发重复全量同步。"""
-        if not self._enabled or not media_key:
-            return
-        try:
-            self._ensure_toggle_scheduler()
-            digest = hashlib.sha256(media_key.encode("utf-8")).hexdigest()[:12]
-            job_id = f"p115_transfer_reconcile_{digest}"
-            run_date = (
-                datetime.datetime.now(tz=pytz.timezone(settings.TZ))
-                + datetime.timedelta(seconds=max(5, delay_seconds))
-            )
-            self._toggle_scheduler.add_job(
-                func=self._reconcile_media_after_transfer,
-                trigger="date",
-                run_date=run_date,
-                args=[media_key, success],
-                id=job_id,
-                replace_existing=True,
-            )
-            logger.info(
-                f"已合并 MP {'入库完成' if success else '整理失败'}事件："
-                f"media_key={media_key}，将在 {max(5, delay_seconds)} 秒后统一对账"
-            )
-        except Exception as error:
-            logger.warning(f"安排 MP 入库防抖对账失败：{error}")
-
-    def _reconcile_media_after_transfer(self, media_key: str, success: bool):
-        """防抖窗口结束后，让 MP 刷新进度并定向对账关联订阅。"""
-        self._init_lifecycle_store()
-        subscribe_ids = self._lifecycle_store.active_subscribe_ids_for_media(media_key)
-        for sid in subscribe_ids:
-            try:
-                with SessionFactory() as db:
-                    subscribe = SubscribeOper(db=db).get(sid)
-                if not subscribe:
-                    continue
-                if subscribe.type == MediaType.TV.value:
-                    SubscribeChain().refresh_subscribe_progress(
-                        subscribe=subscribe,
-                        scene=(
-                            "transfer_complete_debounced"
-                            if success
-                            else "transfer_failed_debounced"
-                        ),
-                    )
-            except Exception as error:
-                logger.warning(
-                    f"防抖后让 MP 刷新订阅 {sid} 进度失败，将由定时对账恢复：{error}"
-                )
-        self._schedule_lifecycle_sync(
-            f"MP入库防抖对账 {media_key}",
-            delay_seconds=5,
-            subscribe_ids=subscribe_ids,
-        )
-
     def _invalidate_subscribe_caches(self, subscribe_info: Any):
         """重置订阅时只清插件/桥接缓存，不改 MoviePilot 数据。"""
         if not subscribe_info:
@@ -1061,12 +999,12 @@ class P115StrgmSub(_PluginBase):
             f"media_key={media_key}, 匹配在途任务={len(matched)}"
         )
 
-        # 逐集事件只负责确认在途任务；同一媒体连续事件统一防抖后再问 MP。
+        # 整理事件只被动确认插件自己的在途状态。
+        # 不刷新 MoviePilot 订阅、不触发即时同步，也不再次搜索或转存。
+        # 后续是否补回仅由既有定时同步读取 MoviePilot 缺集口径后决定。
         if matched:
-            self._schedule_transfer_reconcile(
-                media_key,
-                success=success,
-                delay_seconds=60 if success else 90,
+            logger.info(
+                f"已被动更新在途状态，不接管后续整理链路：media_key={media_key}"
             )
 
     @eventmanager.register(EventType.TransferComplete)
@@ -1349,8 +1287,17 @@ class P115StrgmSub(_PluginBase):
             else:
                 logger.info(f"HDHive 配置已加载（模式：{self._hdhive_query_mode}）")
 
-        if self._cookies:
-            self._p115_manager = P115ClientManager(cookies=self._cookies)
+        # 115 API is intentionally isolated in the p115-openclaw container.
+        # Never import/install p115client in MoviePilot's shared Python environment.
+        if self._classifier_url and self._classifier_token:
+            self._p115_manager = P115ClientManager(
+                cookies=self._cookies,  # accepted only for migration logging; never used
+                base_url=self._classifier_url,
+                token=self._classifier_token,
+                timeout=self._classifier_timeout,
+            )
+        else:
+            self._p115_manager = None
         # AYCLUB Telegram 桥接客户端
         self._ayclub_client = AyclubClient(
             base_url=self._ayclub_url,
@@ -1732,16 +1679,16 @@ class P115StrgmSub(_PluginBase):
 
         # 115 客户端检查
         if not self._p115_manager:
-            logger.error("115 客户端未初始化，请检查 Cookie 配置")
+            logger.error("OpenClaw 115 执行服务未初始化，请检查地址和 Token 配置")
             return False
 
         if not self._p115_manager.check_login():
-            logger.error("115 登录失败，Cookie 可能已过期")
+            logger.error("OpenClaw 115 执行服务不可用或其 115 账号未连接")
             if self._notify:
                 self.post_message(
                     mtype=NotificationType.Manual,
                     title="【115网盘订阅追更】登录失败",
-                    text="115 Cookie 可能已过期，请更新后重试。"
+                    text="请检查 p115-openclaw 运行状态及其独立 115 账号登录。"
                 )
             return False
 

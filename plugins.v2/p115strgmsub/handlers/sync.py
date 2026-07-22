@@ -4,7 +4,10 @@
 """
 import datetime
 import hashlib
+import os
 import re
+from pathlib import Path
+from urllib.parse import unquote
 
 import pytz
 from typing import List, Dict, Any, Set, Optional, Callable
@@ -35,6 +38,9 @@ class SyncHandler:
     AYCLUB_DAILY_REFRESH_RETENTION_DAYS = 30
     ED2K_DISPATCH_DATA_KEY = "ed2k_dispatch_history"
     ED2K_DISPATCH_TTL_HOURS = 24
+    ED2K_MIGRATION_DATA_KEY = "ed2k_dispatch_migration_v189"
+    ED2K_EPISODE_MIGRATION_DATA_KEY = "ed2k_episode_mapping_migration_v190"
+    ED2K_CONTRACT_MIGRATION_DATA_KEY = "ed2k_contract_migration_v192"
 
     def __init__(
         self,
@@ -94,6 +100,135 @@ class SyncHandler:
             get_data_func=get_data_func,
             save_data_func=save_data_func,
         )
+        self._migrate_ed2k_state_v189()
+        self._migrate_ed2k_episode_state_v190()
+        self._migrate_ed2k_contract_state_v192()
+
+    def _migrate_ed2k_state_v189(self) -> None:
+        """清理 1.8.8 可能由模糊 HTTP 2xx 产生的伪在途状态。"""
+        if not self._get_data or not self._save_data:
+            return
+        try:
+            marker = self._get_data(self.ED2K_MIGRATION_DATA_KEY) or {}
+        except Exception as error:
+            logger.warning(f"读取 ED2K 1.8.9 迁移标记失败：{error}")
+            return
+        if isinstance(marker, dict) and marker.get("completed") is True:
+            return
+
+        try:
+            invalidated = self._lifecycle.invalidate_pending_by_source(
+                "ayclub_ed2k",
+                reason="1.8.9 严格任务确认迁移：旧 ED2K 在途状态不再可信",
+            )
+            old_history = self._get_data(self.ED2K_DISPATCH_DATA_KEY) or {}
+            old_history_count = len(old_history) if isinstance(old_history, dict) else 0
+            self._save_data(self.ED2K_DISPATCH_DATA_KEY, {})
+            self._save_data(
+                self.ED2K_MIGRATION_DATA_KEY,
+                {
+                    "completed": True,
+                    "invalidated_pending": len(invalidated),
+                    "cleared_history": old_history_count,
+                    "completed_at": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                },
+            )
+        except Exception as error:
+            logger.error(
+                f"ED2K 1.8.9 状态迁移未完成，将在下次初始化重试："
+                f"{type(error).__name__}"
+            )
+            return
+
+        logger.warning(
+            f"ED2K 1.8.9 状态迁移完成：失效旧在途={len(invalidated)}，"
+            f"清空旧去重记录={old_history_count}；后续仅明确活动任务才会阻止搜索"
+        )
+
+    def _migrate_ed2k_contract_state_v192(self) -> None:
+        """Invalidate plugin-side ED2K state created before backend contract v2."""
+        if not self._get_data or not self._save_data:
+            return
+        try:
+            marker = self._get_data(self.ED2K_CONTRACT_MIGRATION_DATA_KEY) or {}
+        except Exception as error:
+            logger.warning(f"读取 ED2K 1.9.2 contract 迁移标记失败：{error}")
+            return
+        if isinstance(marker, dict) and marker.get("done") is True:
+            return
+
+        try:
+            invalidated = self._lifecycle.invalidate_pending_by_source(
+                "ayclub_ed2k",
+                reason="1.9.2 ED2K contract v2 迁移：旧后端任务状态不再可信",
+            )
+            old_history = self._get_data(self.ED2K_DISPATCH_DATA_KEY) or {}
+            old_history_count = len(old_history) if isinstance(old_history, dict) else 0
+            self._save_data(self.ED2K_DISPATCH_DATA_KEY, {})
+            self._save_data(
+                self.ED2K_CONTRACT_MIGRATION_DATA_KEY,
+                {
+                    "done": True,
+                    "migrated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "invalidated_pending": len(invalidated),
+                    "cleared_history": old_history_count,
+                },
+            )
+        except Exception as error:
+            logger.warning(
+                f"ED2K 1.9.2 contract 迁移未完成，将在下次初始化重试：{error}"
+            )
+            return
+
+        logger.warning(
+            f"ED2K 1.9.2 contract v2 迁移完成：失效旧在途={len(invalidated)}，"
+            f"清空旧去重记录={old_history_count}；旧后端任务不会被自动接管"
+        )
+
+    def _migrate_ed2k_episode_state_v190(self) -> None:
+        """清理 1.8.9 可能把无明确集号 ED2K 误标为当前缺集的状态。"""
+        if not self._get_data or not self._save_data:
+            return
+        try:
+            marker = self._get_data(self.ED2K_EPISODE_MIGRATION_DATA_KEY) or {}
+        except Exception as error:
+            logger.warning(f"读取 ED2K 1.9.0 集号迁移标记失败：{error}")
+            return
+        if isinstance(marker, dict) and marker.get("completed") is True:
+            return
+
+        try:
+            invalidated = self._lifecycle.invalidate_pending_by_source(
+                "ayclub_ed2k",
+                reason="1.9.0 电视剧 ED2K 集号严格匹配迁移：旧映射不再可信",
+            )
+            old_history = self._get_data(self.ED2K_DISPATCH_DATA_KEY) or {}
+            old_history_count = len(old_history) if isinstance(old_history, dict) else 0
+            self._save_data(self.ED2K_DISPATCH_DATA_KEY, {})
+            self._save_data(
+                self.ED2K_EPISODE_MIGRATION_DATA_KEY,
+                {
+                    "completed": True,
+                    "invalidated_pending": len(invalidated),
+                    "cleared_history": old_history_count,
+                    "completed_at": datetime.datetime.now(
+                        datetime.timezone.utc
+                    ).isoformat(),
+                },
+            )
+        except Exception as error:
+            logger.error(
+                f"ED2K 1.9.0 集号迁移未完成，将在下次初始化重试："
+                f"{type(error).__name__}"
+            )
+            return
+
+        logger.warning(
+            f"ED2K 1.9.0 集号迁移完成：失效旧在途={len(invalidated)}，"
+            f"清空旧去重记录={old_history_count}；后续电视剧 ED2K 必须有明确集号"
+        )
 
     def invalidate_subscription_caches(
         self,
@@ -150,50 +285,363 @@ class SyncHandler:
 
     @staticmethod
     def _resource_episode_set(resource: Dict[str, Any]) -> Set[int]:
-        """优先读取桥接结构化集号，并从常见标题格式安全补充。"""
-        result: Set[int] = set()
+        """提取可信集号；ED2K 以标题/真实文件名为准，防止把 2160p 当集号范围。"""
+        structured: Set[int] = set()
         values = resource.get("episodes") or []
         if not isinstance(values, (list, tuple, set)):
             values = []
         for value in values:
             try:
-                result.add(int(value))
+                episode = int(value)
             except (TypeError, ValueError):
-                pass
+                continue
+            if 0 < episode <= 999:
+                structured.add(episode)
         try:
             episode = int(resource.get("episode"))
-            if episode > 0:
-                result.add(episode)
+            if 0 < episode <= 999:
+                structured.add(episode)
         except (TypeError, ValueError):
             pass
         try:
-            start = int(resource.get("episode_start"))
-            end = int(resource.get("episode_end") or start)
-            if 0 < start <= end <= 999:
-                result.update(range(start, end + 1))
+            range_start = int(resource.get("episode_start"))
+            range_end = int(resource.get("episode_end") or range_start)
+            if 0 < range_start <= range_end <= 999:
+                structured.update(range(range_start, range_end + 1))
         except (TypeError, ValueError):
             pass
 
         title = str(resource.get("title") or "")
-        # S01E01、S01E01-E10、E01、E01-E10、中文“第1集”。
+        parse_texts = [title]
+        source_url = str(resource.get("url") or "").strip()
+        is_ed2k = source_url.casefold().startswith("ed2k://|file|")
+        if is_ed2k:
+            parts = source_url.split("|")
+            if len(parts) >= 4:
+                try:
+                    file_name = unquote(parts[2]).strip()
+                except Exception:
+                    file_name = str(parts[2] or "").strip()
+                if file_name and file_name not in parse_texts:
+                    parse_texts.append(file_name)
+
+        parse_text = " ".join(value for value in parse_texts if value)
+        parsed: Set[int] = set()
+
+        # 范围必须在第二个集号后结束；S01E17-2160p 不能误判成 E17-E216。
         for match in re.finditer(
-            r"(?:S\d{1,2})?E(\d{1,3})(?:\s*[-~至—_]\s*E?(\d{1,3}))?",
-            title,
+            r"(?:S\d{1,2})?E0*(\d{1,3})\s*[-~至—_]\s*(?:E\s*)?0*(\d{1,3})(?![0-9pP])",
+            parse_text,
             flags=re.IGNORECASE,
         ):
             try:
-                start = int(match.group(1))
-                end = int(match.group(2) or start)
-                if 0 < start <= end <= 999:
-                    result.update(range(start, end + 1))
+                range_start = int(match.group(1))
+                range_end = int(match.group(2))
             except (TypeError, ValueError):
-                pass
-        for match in re.finditer(r"第\s*(\d{1,3})\s*集", title):
+                continue
+            if 0 < range_start <= range_end <= 999:
+                parsed.update(range(range_start, range_end + 1))
+
+        # 单集独立提取，允许文件名后接分辨率等字段。
+        for match in re.finditer(
+            r"(?:S\d{1,2})?E0*(\d{1,3})(?!\d)",
+            parse_text,
+            flags=re.IGNORECASE,
+        ):
             try:
-                result.add(int(match.group(1)))
+                episode = int(match.group(1))
             except (TypeError, ValueError):
-                pass
-        return {episode for episode in result if episode > 0}
+                continue
+            if 0 < episode <= 999:
+                parsed.add(episode)
+
+        for match in re.finditer(r"第\s*0*(\d{1,3})\s*集", parse_text):
+            try:
+                episode = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0 < episode <= 999:
+                parsed.add(episode)
+
+        # ED2K 的真实文件名最可信，不能让桥接旧缓存中的错误范围覆盖它。
+        if is_ed2k:
+            return parsed
+        return structured | parsed
+
+    @staticmethod
+    def _resource_season_set(resource: Dict[str, Any]) -> Set[int]:
+        result: Set[int] = set()
+        raw_season = resource.get("season")
+        try:
+            if raw_season is not None and int(raw_season) > 0:
+                result.add(int(raw_season))
+        except (TypeError, ValueError):
+            pass
+
+        parse_texts = [str(resource.get("title") or "")]
+        source_url = str(resource.get("url") or "").strip()
+        if source_url.casefold().startswith("ed2k://|file|"):
+            parts = source_url.split("|")
+            if len(parts) >= 4:
+                try:
+                    file_name = unquote(parts[2]).strip()
+                except Exception:
+                    file_name = str(parts[2] or "").strip()
+                if file_name:
+                    parse_texts.append(file_name)
+
+        parse_text = " ".join(value for value in parse_texts if value)
+        for match in re.finditer(r"S\s*0*(\d{1,2})(?=E|[ ._\-])", parse_text, re.I):
+            try:
+                season = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if season > 0:
+                result.add(season)
+        return result
+
+    @staticmethod
+    def _normalized_title_token(value: str) -> str:
+        return "".join(char.casefold() for char in str(value or "") if char.isalnum())
+
+    @staticmethod
+    def _episode_identity_from_text(
+        value: str,
+        *,
+        default_season: Optional[int] = None,
+    ) -> tuple[Set[int], Set[int]]:
+        """Extract explicit season/episode identity without resolution collisions."""
+        text = str(value or "")
+        seasons: Set[int] = set()
+        episodes: Set[int] = set()
+        for match in re.finditer(r"S\s*0*(\d{1,3})(?=E|[ ._\-])", text, re.I):
+            try:
+                number = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0 < number <= 999:
+                seasons.add(number)
+        for match in re.finditer(r"(?:Season|第)\s*0*(\d{1,3})\s*(?:季)?", text, re.I):
+            try:
+                number = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0 < number <= 999:
+                seasons.add(number)
+        for match in re.finditer(
+            r"(?:S\s*\d{1,3})?E\s*0*(\d{1,3})\s*[-~至—_]\s*(?:E\s*)?0*(\d{1,3})(?![0-9pP])",
+            text,
+            re.I,
+        ):
+            try:
+                start, end = int(match.group(1)), int(match.group(2))
+            except (TypeError, ValueError):
+                continue
+            if 0 < start <= end <= 999 and end - start <= 200:
+                episodes.update(range(start, end + 1))
+        for match in re.finditer(r"(?:S\s*\d{1,3})?E\s*0*(\d{1,3})(?!\d)", text, re.I):
+            try:
+                number = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0 < number <= 999:
+                episodes.add(number)
+        for match in re.finditer(r"第\s*0*(\d{1,3})\s*[集话話]", text):
+            try:
+                number = int(match.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 0 < number <= 999:
+                episodes.add(number)
+        if episodes and not seasons and default_season:
+            seasons.add(int(default_season))
+        return seasons, episodes
+
+    def _scan_local_strm_episodes(
+        self,
+        *,
+        mediainfo: MediaInfo,
+        season: int,
+    ) -> tuple[str, Set[int], List[str]]:
+        """Return current playable episodes from the local STRM tree.
+
+        Status is ``ok``, ``not_found`` or ``unavailable``.  A matched show
+        directory with zero STRM files is still an authoritative ``ok`` result.
+        """
+        root = Path(os.getenv("P115STRGMSUB_STRM_ROOT", "/STRM")).expanduser()
+        if not root.is_dir():
+            return "unavailable", set(), []
+
+        title_token = self._normalized_title_token(getattr(mediainfo, "title", ""))
+        tmdb_id = getattr(mediainfo, "tmdb_id", None)
+        tmdb_tokens = {
+            f"tmdb-{int(tmdb_id)}",
+            f"tmdb={int(tmdb_id)}",
+            f"tmdb_{int(tmdb_id)}",
+        } if tmdb_id else set()
+        candidates: List[Path] = []
+        tmdb_candidates: List[Path] = []
+
+        try:
+            for current, dirs, _files in os.walk(root):
+                current_path = Path(current)
+                try:
+                    depth = len(current_path.relative_to(root).parts)
+                except ValueError:
+                    continue
+                if depth > 5:
+                    dirs[:] = []
+                    continue
+                folded_path = str(current_path).casefold()
+                relative_parts = current_path.relative_to(root).parts
+                normalized_parts = [
+                    self._normalized_title_token(part)
+                    for part in relative_parts
+                ]
+                matched_tmdb = any(token in folded_path for token in tmdb_tokens)
+                matched_title = bool(
+                    title_token
+                    and any(
+                        part == title_token or part.startswith(title_token)
+                        for part in normalized_parts
+                    )
+                )
+                if not (matched_tmdb or matched_title):
+                    continue
+                candidate = current_path
+                if re.fullmatch(r"(?:Season|S|第)\s*0*\d{1,3}\s*(?:季)?", candidate.name, re.I):
+                    candidate = candidate.parent
+                target = tmdb_candidates if matched_tmdb else candidates
+                if candidate not in target:
+                    target.append(candidate)
+        except OSError as error:
+            logger.warning(f"扫描本地 STRM 目录失败：{type(error).__name__}")
+            return "unavailable", set(), []
+
+        selected = tmdb_candidates or candidates
+        if not selected:
+            return "not_found", set(), []
+
+        # Keep only top-most unique show roots; title matches may also hit a
+        # Season directory or a nested metadata folder.
+        unique: List[Path] = []
+        for candidate in sorted(selected, key=lambda item: len(item.parts)):
+            if any(candidate == old or old in candidate.parents for old in unique):
+                continue
+            unique.append(candidate)
+
+        episodes: Set[int] = set()
+        scanned = 0
+        for show_root in unique[:8]:
+            try:
+                for item in show_root.rglob("*.strm"):
+                    scanned += 1
+                    if scanned > 5000:
+                        logger.warning("本地 STRM 对账超过 5000 个文件，停止继续扫描")
+                        break
+                    relative_text = str(item.relative_to(show_root))
+                    seasons, found = self._episode_identity_from_text(
+                        relative_text,
+                        default_season=season,
+                    )
+                    if found and (not seasons or int(season) in seasons):
+                        episodes.update(found)
+            except (OSError, ValueError):
+                continue
+        return "ok", episodes, [str(item) for item in unique[:8]]
+
+    @staticmethod
+    def _share_file_name(item: Dict[str, Any]) -> str:
+        return str(
+            item.get("name") or item.get("n") or item.get("fn")
+            or item.get("file_name") or item.get("title") or ""
+        ).strip()
+
+    def _complete_pack_episode_set(
+        self,
+        *,
+        resource: Dict[str, Any],
+        share_files: List[Dict[str, Any]],
+        season: int,
+        total_episode: int,
+        missing_episodes: List[int],
+    ) -> Set[int]:
+        """Verify and return all episodes of a complete single-season pack."""
+        kind = str(resource.get("resource_kind") or "").strip().casefold()
+        complete_marker = bool(resource.get("is_complete_season")) or kind == "season_pack"
+        try:
+            declared_total = int(resource.get("declared_total_episodes") or 0)
+        except (TypeError, ValueError):
+            declared_total = 0
+        if not complete_marker and not declared_total:
+            return set()
+
+        explicit_seasons = self._resource_season_set(resource)
+        if explicit_seasons and int(season) not in explicit_seasons:
+            return set()
+
+        metadata_available = set(self._resource_episode_set(resource))
+        share_available: Set[int] = set()
+        for item in share_files or []:
+            name = self._share_file_name(item)
+            seasons, episodes = self._episode_identity_from_text(
+                name,
+                default_season=season,
+            )
+            if (
+                len(episodes) == 1
+                and (not seasons or int(season) in seasons)
+            ):
+                share_available.update(episodes)
+
+        wanted_missing = {int(value) for value in missing_episodes if int(value) > 0}
+        if not share_available or not (share_available & wanted_missing):
+            return set()
+
+        expected_total = int(total_episode or declared_total or 0)
+        if expected_total > 0:
+            complete = set(range(1, expected_total + 1))
+            # Expansion requires real per-episode files in the share.  Metadata
+            # alone must never make one archive/range file appear 40 times.
+            if complete.issubset(share_available):
+                return complete
+        if declared_total > 0:
+            complete = set(range(1, declared_total + 1))
+            if complete.issubset(share_available):
+                return complete
+        # No trusted total: require both metadata and the actual share to
+        # describe the same contiguous sequence starting at E01.
+        if (
+            share_available
+            and share_available == set(range(1, max(share_available) + 1))
+            and (not metadata_available or metadata_available.issubset(share_available))
+        ):
+            return share_available
+        return set()
+
+    def _select_tv_ed2k_candidate_episodes(
+        self,
+        *,
+        resource: Dict[str, Any],
+        source_episodes: List[int],
+        season: int,
+    ) -> tuple[List[int], str]:
+        """电视剧 ED2K 只允许明确季集号与当前缺集相交的候选。"""
+        explicit_episodes = self._resource_episode_set(resource)
+        if not explicit_episodes:
+            return [], "missing_episode_metadata"
+
+        explicit_seasons = self._resource_season_set(resource)
+        if explicit_seasons and int(season) not in explicit_seasons:
+            return [], "season_mismatch"
+
+        candidate_episodes = sorted(
+            {int(value) for value in source_episodes if int(value) > 0}
+            & explicit_episodes
+        )
+        if not candidate_episodes:
+            return [], "episode_mismatch"
+        return candidate_episodes, "matched"
 
 
     @staticmethod
@@ -343,19 +791,26 @@ class SyncHandler:
         old = history.get(dispatch_key) or {}
 
         if old:
-            attempt_id = str(old.get("attempt_id") or "existing")
-            self._register_ed2k_pending(
-                subscribe=subscribe,
+            share_ref = f"ed2k:{source_ref}"
+            if self._lifecycle.has_live_pending_reference(
                 media_key=media_key,
-                source_ref=source_ref,
-                resource_title=resource_title,
+                share_ref=share_ref,
                 episodes=episodes,
-                attempt_id=attempt_id,
+            ):
+                logger.info(
+                    f"ED2K 本订阅周期已有真实活动在途，跳过重复 POST："
+                    f"ref={source_ref}"
+                )
+                return True, True
+
+            # 去重历史本身不能重新制造 pending_transfer。若历史记录没有对应
+            # 活动在途，删除旧历史并重新提交，让后端明确返回 queued/started 等。
+            history.pop(dispatch_key, None)
+            self._save_ed2k_dispatch_history(history)
+            logger.warning(
+                f"ED2K 去重记录缺少对应活动在途，已废弃并重新提交："
+                f"ref={source_ref}"
             )
-            logger.info(
-                f"ED2K 本订阅周期已提交，跳过重复 POST：ref={source_ref}"
-            )
-            return True, True
 
         result = self._classifier_client.submit_ed2k(
             source_url=source_url,
@@ -366,6 +821,7 @@ class SyncHandler:
             season=season,
             episodes=episodes,
             resource_title=resource_title,
+            request_id=dispatch_key,
         )
         if not result:
             return False, False
@@ -381,7 +837,10 @@ class SyncHandler:
             "episodes": list(episodes or []),
             "attempt_id": attempt_id,
             "submitted_at": now.isoformat(),
-            "status": str(result.get("status") or "accepted"),
+            "status": str(result.get("status") or "queued"),
+            "contract_version": int(result.get("contract_version") or 0),
+            "backend_job_id": str(result.get("job_id") or ""),
+            "request_id": dispatch_key,
         }
         self._save_ed2k_dispatch_history(history)
         self._register_ed2k_pending(
@@ -721,18 +1180,13 @@ class SyncHandler:
         """
         获取七分类目标根目录。
 
-        分类服务未启用时沿用旧目录；
-        分类服务已启用但分类失败时返回 None，禁止盲目转存。
+        1.9.5 起所有 115 写操作必须经过独立 OpenClaw 后端。
+        ``fallback_root`` 仅保留函数签名兼容，不再允许绕过边界校验。
         """
-        if (
-            not self._classifier_client
-            or not self._classifier_client.enabled
-        ):
-            return fallback_root
-
-        if not self._classifier_client.is_ready:
+        del fallback_root
+        if not self._classifier_client or not self._classifier_client.is_ready:
             logger.warning(
-                "OpenClaw 分类服务已启用但配置不完整，跳过转存"
+                "OpenClaw 115 执行服务未配置完整，拒绝直接在 MoviePilot 内转存"
             )
             return None
 
@@ -1332,27 +1786,12 @@ class SyncHandler:
                     meta=meta, mediainfo=mediainfo, totals=totals
                 )
 
-            if exist_flag:
-                self._lifecycle.reconcile_missing(
-                    media_key, media_satisfied=True
-                )
+            mp_reported_satisfied = bool(exist_flag)
+            if mp_reported_satisfied:
                 logger.info(
-                    f"MoviePilot 确认 {mediainfo.title_year} S{season} 已满足订阅"
+                    f"MoviePilot 报告 {mediainfo.title_year} S{season} 已满足订阅，"
+                    "将先用本地 STRM 再确认"
                 )
-                try:
-                    mp_subscribe_chain.check_and_handle_existing_media(
-                        subscribe=subscribe,
-                        meta=meta,
-                        mediainfo=mediainfo,
-                        mediakey=mediakey,
-                    )
-                except Exception as error:
-                    logger.warning(
-                        f"交由 MP 完成订阅失败，将由后续对账恢复：{error}"
-                    )
-                if hasattr(self._search_handler, "clear_sub_points"):
-                    self._search_handler.clear_sub_points(sub_key)
-                return transferred_count
 
             missing_episodes = self._extract_missing_episodes(
                 no_exists=no_exists,
@@ -1366,6 +1805,51 @@ class SyncHandler:
                 ]
 
             mp_missing_episodes = list(missing_episodes)
+
+            # 本地 STRM 是本环境的可播放事实源。MoviePilot 的下载历史和
+            # Emby 扫描可能滞后，因此在搜索前用当前 STRM 文件重建缺集。
+            strm_status, strm_episodes, strm_dirs = self._scan_local_strm_episodes(
+                mediainfo=mediainfo,
+                season=season,
+            )
+            try:
+                total_episode = int(subscribe.total_episode or 0)
+            except (TypeError, ValueError):
+                total_episode = 0
+            start_episode = max(1, int(subscribe.start_episode or 1))
+            if total_episode > 0:
+                expected_episodes = set(range(start_episode, total_episode + 1))
+                if strm_status == "ok":
+                    local_missing = sorted(expected_episodes - strm_episodes)
+                    if set(local_missing) != set(mp_missing_episodes):
+                        logger.warning(
+                            f"STRM 实时对账修正 {mediainfo.title_year} S{season} 缺集："
+                            f"MP={sorted(mp_missing_episodes)}，"
+                            f"STRM={local_missing}，已存在STRM={sorted(strm_episodes)}"
+                        )
+                    missing_episodes = local_missing
+                    mp_missing_episodes = list(local_missing)
+                    logger.info(
+                        f"{mediainfo.title_year} S{season} STRM 对账目录："
+                        f"{strm_dirs[:3]}"
+                    )
+                elif strm_status == "unavailable":
+                    logger.error(
+                        f"{mediainfo.title_year} S{season} 无法访问本地 STRM 根目录，"
+                        "为避免使用陈旧订阅历史，本轮停止该订阅"
+                    )
+                    return transferred_count
+                else:
+                    # 新订阅在还没有任何已存在集时可以没有 show 目录；若 MP
+                    # 声称已有剧集而 STRM 目录完全找不到，则状态冲突，安全停止。
+                    mp_present = expected_episodes - set(mp_missing_episodes)
+                    if mp_present:
+                        logger.error(
+                            f"{mediainfo.title_year} S{season} MP 声称已有集数 "
+                            f"{sorted(mp_present)}，但未找到对应 STRM 目录；"
+                            "本轮停止该订阅"
+                        )
+                        return transferred_count
 
             # MP 事件是主路径；插件只用在途任务避免整理期间重复投递。
             pending_episodes = self._lifecycle.pending_episodes(media_key)
@@ -1390,6 +1874,23 @@ class SyncHandler:
                 logger.info(
                     f"{mediainfo.title_year} S{season} 当前没有需要新投递的剧集"
                 )
+                if mp_reported_satisfied:
+                    self._lifecycle.reconcile_missing(
+                        media_key, media_satisfied=True
+                    )
+                    try:
+                        mp_subscribe_chain.check_and_handle_existing_media(
+                            subscribe=subscribe,
+                            meta=meta,
+                            mediainfo=mediainfo,
+                            mediakey=mediakey,
+                        )
+                    except Exception as error:
+                        logger.warning(
+                            f"交由 MP 完成订阅失败，将由后续对账恢复：{error}"
+                        )
+                    if hasattr(self._search_handler, "clear_sub_points"):
+                        self._search_handler.clear_sub_points(sub_key)
                 return transferred_count
 
             is_best_version = bool(subscribe.best_version)
@@ -1764,16 +2265,18 @@ class SyncHandler:
                     ]
 
                     for resource in ayclub_ed2k_results:
-                        explicit_episodes = self._resource_episode_set(resource)
-                        candidate_episodes = [
-                            episode
-                            for episode in source_episodes
-                            if (
-                                not explicit_episodes
-                                or episode in explicit_episodes
+                        candidate_episodes, reject_reason = (
+                            self._select_tv_ed2k_candidate_episodes(
+                                resource=resource,
+                                source_episodes=source_episodes,
+                                season=int(season),
                             )
-                        ]
+                        )
                         if not candidate_episodes:
+                            logger.warning(
+                                f"跳过电视剧 ED2K：ref={self._ed2k_source_ref(str(resource.get('url') or ''))}，"
+                                f"原因={reject_reason}；必须明确匹配当前季缺集"
+                            )
                             continue
 
                         accepted, _ = self._dispatch_ed2k_resource(
@@ -1918,6 +2421,21 @@ class SyncHandler:
                                     episode for episode in candidate_episodes
                                     if episode in resource_episodes
                                 ]
+
+                            complete_pack_episodes = self._complete_pack_episode_set(
+                                resource=resource,
+                                share_files=share_files,
+                                season=season,
+                                total_episode=int(subscribe.total_episode or 0),
+                                missing_episodes=source_episodes,
+                            )
+                            if complete_pack_episodes:
+                                candidate_episodes = sorted(complete_pack_episodes)
+                                logger.info(
+                                    f"AYCLUB 已验证完整单季包，允许同时补缺和覆盖洗版："
+                                    f"S{season} E{candidate_episodes[0]:02d}-"
+                                    f"E{candidate_episodes[-1]:02d}"
+                                )
 
                         for episode in candidate_episodes:
                             matched_file = FileMatcher.match_episode_file(

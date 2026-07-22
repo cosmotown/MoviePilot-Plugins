@@ -524,6 +524,80 @@ class LifecycleStore:
                 self._save(state)
             return result
 
+    def has_live_pending_reference(
+        self,
+        *,
+        media_key: str,
+        share_ref: str,
+        episodes: Optional[Iterable[int]] = None,
+    ) -> bool:
+        """确认去重记录是否仍有对应的真实活动在途状态。"""
+        wanted: Set[int] = set()
+        for value in episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                wanted.add(episode)
+
+        with self._lock:
+            state = self._load()
+            changed = self._expire_stale(state, media_key)
+            matched: Set[int] = set()
+            has_movie = False
+            for task in state["pending"].values():
+                if (
+                    task.get("media_key") != media_key
+                    or str(task.get("share_ref") or "") != str(share_ref or "")
+                    or not self._is_live_pending(task)
+                ):
+                    continue
+                episode = task.get("episode")
+                if episode is None:
+                    has_movie = True
+                    continue
+                try:
+                    matched.add(int(episode))
+                except (TypeError, ValueError):
+                    continue
+            if changed:
+                self._save(state)
+            return wanted.issubset(matched) if wanted else has_movie
+
+    def invalidate_pending_by_source(
+        self,
+        source: str,
+        *,
+        reason: str,
+    ) -> List[Dict[str, Any]]:
+        """一次性使指定来源的活动在途记录失效，并保留审计记录。"""
+        normalized_source = str(source or "").strip()
+        invalidated: List[Dict[str, Any]] = []
+        if not normalized_source:
+            return invalidated
+
+        with self._lock:
+            state = self._load()
+            for task in state["pending"].values():
+                if (
+                    str(task.get("source") or "") != normalized_source
+                    or not self._is_live_pending(task)
+                ):
+                    continue
+                task["status"] = "invalidated"
+                task["invalidated_at"] = self._now_text()
+                task["failure_reason"] = str(reason or "状态迁移失效")
+                task["updated_at"] = self._now_text()
+                invalidated.append(dict(task))
+            if invalidated:
+                if not self._save_data:
+                    return []
+                state["schema_version"] = self.SCHEMA_VERSION
+                # 状态迁移需要明确知道写入是否成功，因此这里不吞掉异常。
+                self._save_data(self.DATA_KEY, state)
+        return invalidated
+
     def blocking_pending_tasks(self) -> List[Dict[str, Any]]:
         """返回仍可能造成 MoviePilot 原生订阅重复下载的活动在途任务。
 
