@@ -1,6 +1,6 @@
 # P115StrgmSub - 115网盘订阅追更插件
 
-当前版本：**1.9.7**
+当前版本：**1.9.8**
 
 MoviePilot v2 插件。根据 MoviePilot 订阅、媒体库正式缺失状态和本地 STRM 实际文件，从 115 分享与 AYCLUB 结构化结果中选择目标资源。115 API 与选择性转存统一交给独立的 p115-openclaw 服务执行；插件不读取 115 Cookie、不安装 `p115client`，也不接管 MoviePilot 后续整理和订阅完成状态。
 
@@ -18,6 +18,13 @@ MoviePilot 订阅
   → MoviePilot 正式缺失检查确认入库
 ```
 
+## 1.9.8 修复
+
+- **修复最后一轮误读缓存**：MoviePilot 自动服务改用无参数专用入口，在入口内显式标记 `scheduled_cron`，不再依赖调度层传递业务 `kwargs`。
+- **保持 Cron 语义**：继续由 `_is_last_run_today()` 按实际 Cron 计算当天最后一轮；`0 5,13,21 * * *` 的 05:00、13:00 仍只读缓存，21:00 对已播缺集执行 `scheduled_evening_refresh` 真实搜索。
+- **边界不扩大**：手动同步、`onlyonce` 和生命周期定向同步不冒充最后一轮；电影退避、已完成订阅过滤、电视剧播出门禁及 AYCLUB Bridge 协议均未修改。
+- **增强入口日志**：记录触发原因、是否定向、是否最后一轮、刷新授权和 Cron，便于直接核对调度链路。
+
 ## 1.9.7 修复
 
 - **堵住生命周期强刷无限重试**：普通搜索、`lifecycle_force_refresh` 和 `scheduled_evening_refresh` 共享同一电影每日真实搜索额度；自动任务每个 TMDB media key 每日最多发送一次 Telegram 查询，只有明确的人工强刷入口可绕过。
@@ -26,7 +33,7 @@ MoviePilot 订阅
 - **迟到回复消费**：插件请求携带 `request_id`，识别桥接返回的原始请求 ID 与迟到回复缓存；迟到的空结果可在后续 cache-only 查询中直接消费并清除强刷标记。
 - **可观测日志**：门禁和结果日志增加 `force_refresh_pending`、`last_real_search_at`、`retry_after`、`daily_search_count`、`no_result_cooldown_until` 和跳过原因。
 
-配套 AYCLUB Bridge 1.5.0 同时修复“没有找到资源”未被识别而误报 504，并在 HTTP 超时后继续关联迟到回复写入缓存。插件 1.9.7 即使暂时连接旧桥接，也会先阻止 504 后的同日重复搜索；升级桥接后才能完整获得 request_id 和迟到缓存能力。
+配套 AYCLUB Bridge 1.5.1 负责识别明确无资源终态、关联请求回复并缓存迟到结果。本次 1.9.8 不修改桥接器或其协议字段。
 
 ## 1.9.6 修复
 
@@ -48,8 +55,8 @@ MoviePilot 订阅
 ## 版本组件
 
 ```text
-plugins.v2/p115strgmsub/        P115StrgmSub 1.9.7
-companion/tg-ayclub-bridge/     AYCLUB Bridge 1.5.0（独立配套项目，不在本仓库）
+plugins.v2/p115strgmsub/        P115StrgmSub 1.9.8
+companion/tg-ayclub-bridge/     AYCLUB Bridge 1.5.1（独立配套项目，不在本仓库）
 ```
 
 桥接源码不应复制进 MoviePilot 插件目录。它应覆盖桥接项目原有 `bridge.py`，并继续使用本机私有 Session 与环境变量。

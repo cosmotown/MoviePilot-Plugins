@@ -50,7 +50,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.7"
+    plugin_version = "1.9.8"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -1594,6 +1594,10 @@ class P115StrgmSub(_PluginBase):
         }]
 
 
+    def scheduled_sync_subscribes(self):
+        """MoviePilot 自动服务专用入口，避免调度器丢失业务参数。"""
+        return self.sync_subscribes(trigger_reason="scheduled_cron")
+
     def get_service(self) -> List[Dict[str, Any]]:
         if not self._enabled:
             return []
@@ -1609,8 +1613,7 @@ class P115StrgmSub(_PluginBase):
                         self._cron,
                         timezone=pytz.timezone(settings.TZ),
                     ),
-                    "func": self.sync_subscribes,
-                    "kwargs": {"trigger_reason": "scheduled_cron"}
+                    "func": self.scheduled_sync_subscribes,
                 })
             except Exception as e:
                 logger.warning(f"Cron 表达式无效：{self._cron}，将回退 interval=8h。错误：{e}")
@@ -1618,7 +1621,7 @@ class P115StrgmSub(_PluginBase):
                     "id": "P115StrgmSub",
                     "name": "115网盘订阅追更服务",
                     "trigger": "interval",
-                    "func": self.sync_subscribes,
+                    "func": self.scheduled_sync_subscribes,
                     "kwargs": {"hours": 8}
                 })
         else:
@@ -1626,7 +1629,7 @@ class P115StrgmSub(_PluginBase):
                 "id": "P115StrgmSub",
                 "name": "115网盘订阅追更服务",
                 "trigger": "interval",
-                "func": self.sync_subscribes,
+                "func": self.scheduled_sync_subscribes,
                 "kwargs": {"hours": 8}
             })
 
@@ -1857,10 +1860,24 @@ class P115StrgmSub(_PluginBase):
         with lock:
             tz = pytz.timezone(settings.TZ)
             run_start = datetime.datetime.now(tz=tz)
-            scheduled_evening_refresh = bool(
-                target_subscribe_ids is None
+            targeted_request = target_subscribe_ids is not None
+            is_last_run_today = bool(
+                not targeted_request
                 and trigger_reason == "scheduled_cron"
                 and self._is_last_run_today(run_start)
+            )
+            scheduled_evening_refresh = bool(
+                not targeted_request
+                and trigger_reason == "scheduled_cron"
+                and is_last_run_today
+            )
+            logger.info(
+                "同步入口："
+                f"trigger_reason={trigger_reason or 'manual_or_api'}，"
+                f"targeted={targeted_request}，"
+                f"is_last_run_today={is_last_run_today}，"
+                f"scheduled_evening_refresh={scheduled_evening_refresh}，"
+                f"cron={self._cron or 'interval=8h'}"
             )
             if trigger_reason == "scheduled_cron":
                 logger.info(
