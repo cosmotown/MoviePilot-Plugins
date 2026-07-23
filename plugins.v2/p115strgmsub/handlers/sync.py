@@ -6,6 +6,7 @@ import datetime
 import hashlib
 import os
 import re
+import uuid
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -1444,11 +1445,42 @@ class SyncHandler:
                 f"原因={movie_gate.get('reason')}，"
                 f"模式={'强刷' if movie_gate.get('force_refresh') else ('仅缓存' if movie_gate.get('cache_only') else '禁用')}，"
                 f"间隔={movie_gate.get('interval_days')}天，"
-                f"下次允许={movie_gate.get('next_search_at')}"
+                f"下次允许={movie_gate.get('next_search_at')}，"
+                f"force_refresh_pending={movie_gate.get('force_refresh_pending')}，"
+                f"last_real_search_at={movie_gate.get('last_real_search_at')}，"
+                f"retry_after={movie_gate.get('retry_after')}，"
+                f"daily_search_count={movie_gate.get('daily_search_count')}，"
+                f"no_result_cooldown_until={movie_gate.get('no_result_cooldown_until')}，"
+                f"跳过原因={movie_gate.get('skip_reason')}"
             )
 
             # 防止读取到上一个订阅遗留的 AYCLUB 查询状态
-            self._search_handler.reset_ayclub_status()      
+            self._search_handler.reset_ayclub_status()
+            ayclub_request_id = uuid.uuid4().hex
+            ayclub_attempt_reserved = False
+            if (
+                mediainfo.tmdb_id
+                and movie_gate.get("allow_ayclub")
+                and movie_gate.get("force_refresh")
+                and "ayclub" in self._search_handler.get_enabled_sources(
+                    ayclub_first=True,
+                    allow_ayclub=True,
+                )
+            ):
+                ayclub_attempt_reserved = (
+                    self._release_gate.reserve_movie_real_search(
+                        tmdb_id=int(mediainfo.tmdb_id),
+                        trigger_reason=str(
+                            movie_gate.get("reason") or "unknown"
+                        ),
+                        lifecycle_force_refresh=lifecycle_force_refresh,
+                        request_id=ayclub_request_id,
+                    )
+                )
+                if not ayclub_attempt_reserved:
+                    movie_gate["force_refresh"] = False
+                    movie_gate["cache_only"] = True
+                    movie_gate["reason"] = "daily_search_limit"
             # 创建订阅过滤条件
             subscribe_filter = SubscribeFilter(
                 quality=subscribe.quality,
@@ -1478,6 +1510,7 @@ class SyncHandler:
                 ),
                 force_refresh=bool(movie_gate.get("force_refresh")),
                 cache_only=bool(movie_gate.get("cache_only")),
+                request_id=ayclub_request_id,
                 yield_source_end=True,
             )
 
@@ -1684,22 +1717,16 @@ class SyncHandler:
             ayclub_query_status = self._search_handler.get_ayclub_last_status()
             ayclub_cached = self._search_handler.get_ayclub_last_cached()
             force_honored = self._search_handler.was_ayclub_force_refresh_honored()
+            ayclub_late_reply = self._search_handler.was_ayclub_late_reply()
+            ayclub_result_request_id = (
+                self._search_handler.get_ayclub_last_origin_request_id()
+                or self._search_handler.get_ayclub_last_request_id()
+                or ayclub_request_id
+            )
 
-            if lifecycle_force_refresh:
-                if force_honored:
-                    self._lifecycle.clear_force_refresh(int(subscribe.id))
-                    logger.info(
-                        f"订阅 {subscribe.id} 的 AYCLUB 生命周期强刷已确认绕过缓存，"
-                        "清除一次性标记"
-                    )
-                elif ayclub_query_status not in {"idle", "disabled"}:
-                    logger.warning(
-                        f"订阅 {subscribe.id} 已请求 AYCLUB 生命周期强刷，"
-                        "但桥接未确认绕过缓存；保留强刷标记"
-                    )
-
+            result_recorded = False
             if mediainfo.tmdb_id and movie_gate.get("allow_ayclub"):
-                self._release_gate.mark_movie_search_result(
+                result_recorded = self._release_gate.mark_movie_search_result(
                     tmdb_id=int(mediainfo.tmdb_id),
                     search_status=ayclub_query_status,
                     cached=ayclub_cached,
@@ -1709,6 +1736,52 @@ class SyncHandler:
                         if ayclub_query_status == "ok_matched"
                         else None
                     ),
+                    attempt_reserved=ayclub_attempt_reserved,
+                    late_reply=ayclub_late_reply,
+                    request_id=ayclub_result_request_id,
+                )
+
+            if lifecycle_force_refresh:
+                lifecycle_terminal = (
+                    ayclub_query_status in {
+                        "ok_empty",
+                        "ok_matched",
+                        "cached_empty",
+                    }
+                    and (
+                        force_honored
+                        or ayclub_cached is False
+                        or ayclub_late_reply
+                    )
+                )
+                if lifecycle_terminal:
+                    self._lifecycle.clear_force_refresh(int(subscribe.id))
+                    logger.info(
+                        f"订阅 {subscribe.id} 的 AYCLUB 生命周期强刷已取得终态，"
+                        f"status={ayclub_query_status}，迟到回复={ayclub_late_reply}，"
+                        f"request_id={ayclub_result_request_id}，清除一次性标记"
+                    )
+                elif ayclub_query_status not in {"idle", "disabled"}:
+                    logger.warning(
+                        f"订阅 {subscribe.id} 已请求 AYCLUB 生命周期强刷，"
+                        f"但尚未取得终态；force_refresh_pending=True，"
+                        f"status={ayclub_query_status}，"
+                        f"request_id={ayclub_result_request_id}，"
+                        "保留强刷标记并按 retry_after/每日额度限制后续自动任务"
+                    )
+
+            if result_recorded and mediainfo.tmdb_id:
+                result_state = self._release_gate.get_movie(
+                    int(mediainfo.tmdb_id)
+                )
+                logger.info(
+                    f"电影 {mediainfo.title} AYCLUB 状态："
+                    f"force_refresh_pending={result_state.get('force_refresh_pending')}，"
+                    f"last_real_search_at={result_state.get('last_real_search_at')}，"
+                    f"retry_after={result_state.get('retry_after')}，"
+                    f"daily_search_count={result_state.get('daily_search_count')}，"
+                    f"no_result_cooldown_until={result_state.get('no_result_cooldown_until')}，"
+                    f"跳过原因={result_state.get('last_skip_reason')}"
                 )
 
             if not resource_found:

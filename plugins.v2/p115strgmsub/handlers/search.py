@@ -150,6 +150,9 @@ class SearchHandler:
 
         self._ayclub_client.last_status = "idle"
         self._ayclub_client.last_error = ""
+        self._ayclub_client.last_request_id = None
+        self._ayclub_client.last_origin_request_id = None
+        self._ayclub_client.last_late_reply = False
 
     def get_ayclub_last_status(self) -> str:
         """读取最近一次 AYCLUB 查询状态。"""
@@ -195,6 +198,24 @@ class SearchHandler:
         if not self._ayclub_client:
             return False
         return bool(getattr(self._ayclub_client, "last_force_refresh_honored", False))
+
+    def get_ayclub_last_request_id(self) -> Optional[str]:
+        """读取桥接回传的本次请求标识。"""
+        if not self._ayclub_client:
+            return None
+        return getattr(self._ayclub_client, "last_request_id", None)
+
+    def get_ayclub_last_origin_request_id(self) -> Optional[str]:
+        """读取缓存结果对应的原始 Telegram 请求标识。"""
+        if not self._ayclub_client:
+            return None
+        return getattr(self._ayclub_client, "last_origin_request_id", None)
+
+    def was_ayclub_late_reply(self) -> bool:
+        """桥接缓存是否来自 HTTP 超时后的 Telegram 迟到回复。"""
+        if not self._ayclub_client:
+            return False
+        return bool(getattr(self._ayclub_client, "last_late_reply", False))
         
     def search_resources(
         self,
@@ -206,6 +227,7 @@ class SearchHandler:
         allow_ayclub: bool = True,
         force_refresh: bool = False,
         cache_only: bool = False,
+        request_id: Optional[str] = None,
     ) -> List[Dict]:
         """
         统一的资源搜索方法，支持电影和电视剧
@@ -233,6 +255,7 @@ class SearchHandler:
                 episodes=episodes,
                 force_refresh=force_refresh,
                 cache_only=(cache_only if source == "ayclub" else False),
+                request_id=(request_id if source == "ayclub" else None),
             )
             if results:
                 return results
@@ -254,6 +277,7 @@ class SearchHandler:
         allow_ayclub: bool = True,
         force_refresh: bool = False,
         cache_only: bool = False,
+        request_id: Optional[str] = None,
         yield_source_end: bool = False,
     ) -> Iterator[Dict]:
         """
@@ -284,6 +308,7 @@ class SearchHandler:
                 episodes=episodes,
                 force_refresh=force_refresh,
                 cache_only=(cache_only if source == "ayclub" else False),
+                request_id=(request_id if source == "ayclub" else None),
             )
 
             if not results:
@@ -329,6 +354,7 @@ class SearchHandler:
         episodes: Optional[List[int]] = None,
         force_refresh: bool = False,
         cache_only: bool = False,
+        request_id: Optional[str] = None,
     ) -> List[Dict]:
         """
         使用指定的单一搜索源查询资源
@@ -359,6 +385,7 @@ class SearchHandler:
                 episodes=episodes,
                 force_refresh=force_refresh,
                 cache_only=cache_only,
+                request_id=request_id,
             )
         else:
             logger.warning(f"未知的搜索源: {source}")

@@ -19,8 +19,12 @@ class ReleaseGateStore:
     """发布门禁状态持久化管理器。"""
 
     DATA_KEY = "release_gate_state"
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     RETENTION_DAYS = 90
+    MOVIE_DAILY_SEARCH_LIMIT = 1
+    MOVIE_DAILY_FAILURE_LIMIT = 2
+    MOVIE_FAILURE_RETRY_HOURS = 6
+    MOVIE_NO_RESULT_COOLDOWN_HOURS = 24
 
     def __init__(
         self,
@@ -146,6 +150,19 @@ class ReleaseGateStore:
             "next_movie_real_search_at": None,
             "last_movie_search_status": None,
             "last_movie_search_interval_days": None,
+            # 电影 AYCLUB 统一限流状态（schema v3）。
+            # 普通、生命周期和定时晚间搜索共享同一份每日额度；
+            # 只有明确的人工强刷入口可以绕过。
+            "force_refresh_pending": False,
+            "last_real_search_at": None,
+            "retry_after": None,
+            "daily_search_date": None,
+            "daily_search_count": 0,
+            "daily_failure_count": 0,
+            "no_result_cooldown_until": None,
+            "last_skip_reason": None,
+            "last_search_trigger": None,
+            "last_request_id": None,
             "updated_at": None,
         }
 
@@ -427,6 +444,16 @@ class ReleaseGateStore:
         return max(base, floor)
 
     def _movie_real_search_due(self, state: Dict[str, Any]) -> bool:
+        if state.get("last_movie_search_status") in {
+            "timeout",
+            "http_error",
+            "error",
+            "invalid_result",
+            "pending_reply",
+        }:
+            retry_after = self._parse_datetime(state.get("retry_after"))
+            return not retry_after or self.now() >= retry_after
+
         last_search = self._parse_datetime(
             state.get("last_movie_real_search_at")
         )
@@ -436,6 +463,64 @@ class ReleaseGateStore:
         return self.now() >= (
             last_search + datetime.timedelta(days=interval_days)
         )
+
+    def _normalize_movie_daily_state(
+        self,
+        state: Dict[str, Any],
+    ) -> None:
+        """跨日时重置电影真实搜索的每日计数。"""
+        today_text = self.today().isoformat()
+        if state.get("daily_search_date") == today_text:
+            return
+        state["daily_search_date"] = today_text
+        last_search = self._parse_datetime(
+            state.get("last_real_search_at")
+            or state.get("last_movie_real_search_at")
+        )
+        state["daily_search_count"] = (
+            1
+            if last_search and last_search.date() == self.today()
+            else 0
+        )
+        state["daily_failure_count"] = 0
+
+    @staticmethod
+    def _safe_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _movie_automatic_skip_reason(
+        self,
+        state: Dict[str, Any],
+    ) -> Optional[str]:
+        """返回自动真实搜索应跳过的原因；人工强刷不调用此门禁。"""
+        self._normalize_movie_daily_state(state)
+        now = self.now()
+        retry_after = self._parse_datetime(state.get("retry_after"))
+        if retry_after and now < retry_after:
+            return "retry_after_wait"
+
+        cooldown_until = self._parse_datetime(
+            state.get("no_result_cooldown_until")
+        )
+        if cooldown_until and now < cooldown_until:
+            return "no_result_cooldown"
+
+        if (
+            self._safe_count(state.get("daily_failure_count"))
+            >= self.MOVIE_DAILY_FAILURE_LIMIT
+        ):
+            return "daily_failure_limit"
+
+        if (
+            self._safe_count(state.get("daily_search_count"))
+            >= self.MOVIE_DAILY_SEARCH_LIMIT
+        ):
+            return "daily_search_limit"
+
+        return None
 
     def _movie_in_refresh_window(self) -> bool:
         """普通电影真实搜索只在本地时区 22:00-23:59 执行。"""
@@ -494,6 +579,25 @@ class ReleaseGateStore:
             "real_search_due": bool(real_search_due),
             "interval_days": interval_days,
             "next_search_at": state.get("next_movie_real_search_at"),
+            "force_refresh_pending": bool(
+                state.get("force_refresh_pending")
+            ),
+            "last_real_search_at": (
+                state.get("last_real_search_at")
+                or state.get("last_movie_real_search_at")
+            ),
+            "retry_after": state.get("retry_after"),
+            "daily_search_count": ReleaseGateStore._safe_count(
+                state.get("daily_search_count")
+            ),
+            "no_result_cooldown_until": state.get(
+                "no_result_cooldown_until"
+            ),
+            "skip_reason": (
+                reason
+                if cache_only or not allow_ayclub
+                else None
+            ),
             "state": state,
         }
 
@@ -503,6 +607,7 @@ class ReleaseGateStore:
         theatrical_date: Optional[str] = None,
         lifecycle_force_refresh: bool = False,
         scheduled_evening_refresh: bool = False,
+        explicit_manual_force_refresh: bool = False,
     ) -> Dict[str, Any]:
         """
         判断电影本次 AYCLUB 查询模式。
@@ -613,7 +718,38 @@ class ReleaseGateStore:
             # 当天已检查过 TMDB 时，也要持久化 MoviePilot 给出的影院上映日。
             self.save(state)
 
-        # 生命周期事件是明确的用户意图，允许立即绕过缓存和时间窗口。
+        self._normalize_movie_daily_state(state)
+        state["force_refresh_pending"] = bool(lifecycle_force_refresh)
+
+        # 只有明确的人工强刷入口可以绕过每日额度、失败退避和无结果冷却。
+        if explicit_manual_force_refresh:
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=True,
+                probe_due=not bool(state.get("released")),
+                reason="explicit_manual_force_refresh",
+                force_refresh=True,
+                cache_only=False,
+                real_search_due=True,
+                interval_days=self._movie_search_interval_days(state),
+            )
+
+        automatic_skip_reason = self._movie_automatic_skip_reason(state)
+        if automatic_skip_reason:
+            state["last_skip_reason"] = automatic_skip_reason
+            self.save(state)
+            return self._movie_decision(
+                state=state,
+                allow_ayclub=True,
+                probe_due=not bool(state.get("released")),
+                reason=automatic_skip_reason,
+                force_refresh=False,
+                cache_only=True,
+                real_search_due=False,
+                interval_days=self._movie_search_interval_days(state),
+            )
+
+        # 生命周期事件允许越过时间窗口，但仍受统一每日额度和失败退避约束。
         if lifecycle_force_refresh:
             return self._movie_decision(
                 state=state,
@@ -697,6 +833,57 @@ class ReleaseGateStore:
             interval_days=14,
         )
 
+    def reserve_movie_real_search(
+        self,
+        tmdb_id: int,
+        trigger_reason: str,
+        *,
+        lifecycle_force_refresh: bool = False,
+        explicit_manual_force_refresh: bool = False,
+        request_id: Optional[str] = None,
+    ) -> bool:
+        """在访问桥接前持久化真实搜索额度，避免超时后重复发送消息。"""
+        state = self.get_movie(tmdb_id)
+        self._normalize_movie_daily_state(state)
+
+        if not explicit_manual_force_refresh:
+            skip_reason = self._movie_automatic_skip_reason(state)
+            if skip_reason:
+                state["last_skip_reason"] = skip_reason
+                self.save(state)
+                logger.info(
+                    f"电影 TMDB {tmdb_id} 跳过 AYCLUB 真实搜索："
+                    f"跳过原因={skip_reason}，"
+                    f"force_refresh_pending={bool(lifecycle_force_refresh)}，"
+                    f"last_real_search_at={state.get('last_real_search_at')}，"
+                    f"retry_after={state.get('retry_after')}，"
+                    f"daily_search_count={self._safe_count(state.get('daily_search_count'))}，"
+                    f"no_result_cooldown_until={state.get('no_result_cooldown_until')}"
+                )
+                return False
+
+        now = self.now()
+        state["daily_search_count"] = (
+            self._safe_count(state.get("daily_search_count")) + 1
+        )
+        state["last_real_search_at"] = now.isoformat()
+        state["last_movie_real_search_at"] = now.isoformat()
+        state["last_search_trigger"] = str(trigger_reason or "unknown")
+        state["last_request_id"] = request_id
+        state["last_skip_reason"] = None
+        state["force_refresh_pending"] = bool(lifecycle_force_refresh)
+        self.save(state)
+        logger.info(
+            f"电影 TMDB {tmdb_id} 已占用 AYCLUB 真实搜索额度："
+            f"原因={trigger_reason}，"
+            f"force_refresh_pending={state['force_refresh_pending']}，"
+            f"last_real_search_at={state['last_real_search_at']}，"
+            f"retry_after={state.get('retry_after')}，"
+            f"daily_search_count={state['daily_search_count']}，"
+            f"no_result_cooldown_until={state.get('no_result_cooldown_until')}"
+        )
+        return True
+
     def mark_movie_search_result(
         self,
         tmdb_id: int,
@@ -704,25 +891,88 @@ class ReleaseGateStore:
         cached: Optional[bool],
         force_honored: bool = False,
         usable_candidate: Optional[bool] = None,
+        attempt_reserved: bool = False,
+        late_reply: bool = False,
+        request_id: Optional[str] = None,
     ) -> bool:
         """记录一次真实 AYCLUB 电影查询，并计算下次允许时间。
 
         桥接返回 ok_matched 只代表标题层面有候选。若所有 AYCLUB 分享
         均失效、无内容或没有匹配影片文件，则按本次无可用结果退避。
         """
+        state = self.get_movie(tmdb_id)
+        self._normalize_movie_daily_state(state)
+        now = self.now()
         bridge_status = str(search_status or "")
-        if bridge_status not in {"ok_empty", "ok_matched"}:
+        failure_statuses = {
+            "timeout",
+            "http_error",
+            "error",
+            "invalid_result",
+            "pending_reply",
+        }
+        terminal_statuses = {
+            "ok_empty",
+            "ok_matched",
+            "cached_empty",
+        }
+        is_failure = bridge_status in failure_statuses
+        is_late_terminal = bool(late_reply and bridge_status in terminal_statuses)
+        real_query = bool(
+            attempt_reserved
+            or force_honored
+            or cached is False
+        )
+
+        if not real_query and not is_late_terminal:
             return False
-        real_query = bool(force_honored or cached is False)
-        if not real_query:
+
+        if not attempt_reserved and real_query:
+            state["daily_search_count"] = (
+                self._safe_count(state.get("daily_search_count")) + 1
+            )
+            state["last_real_search_at"] = now.isoformat()
+            state["last_movie_real_search_at"] = now.isoformat()
+
+        state["last_movie_bridge_status"] = bridge_status
+        if request_id:
+            state["last_request_id"] = request_id
+
+        if is_failure:
+            state["daily_failure_count"] = min(
+                self.MOVIE_DAILY_FAILURE_LIMIT,
+                self._safe_count(state.get("daily_failure_count")) + 1,
+            )
+            state["last_movie_search_status"] = bridge_status
+            state["retry_after"] = (
+                now + datetime.timedelta(
+                    hours=self.MOVIE_FAILURE_RETRY_HOURS
+                )
+            ).isoformat()
+            state["last_skip_reason"] = "retry_after_wait"
+            self.save(state)
+            logger.warning(
+                f"电影 TMDB {tmdb_id} AYCLUB 真实查询失败："
+                f"status={bridge_status}，"
+                f"force_refresh_pending={state.get('force_refresh_pending')}，"
+                f"last_real_search_at={state.get('last_real_search_at')}，"
+                f"retry_after={state.get('retry_after')}，"
+                f"daily_search_count={state.get('daily_search_count')}，"
+                f"daily_failure_count={state.get('daily_failure_count')}，"
+                f"no_result_cooldown_until={state.get('no_result_cooldown_until')}，"
+                "跳过原因=后续自动任务等待 retry_after 且受每日次数限制"
+            )
+            return True
+
+        if bridge_status not in terminal_statuses:
             return False
 
         effective_status = bridge_status
+        if bridge_status == "cached_empty" and is_late_terminal:
+            effective_status = "ok_empty"
         if bridge_status == "ok_matched" and usable_candidate is False:
             effective_status = "ok_empty"
 
-        state = self.get_movie(tmdb_id)
-        now = self.now()
         if effective_status == "ok_empty":
             try:
                 empty_count = int(state.get("movie_empty_count") or 0) + 1
@@ -737,13 +987,51 @@ class ReleaseGateStore:
             if state.get("released")
             else 14
         )
-        state["last_movie_real_search_at"] = now.isoformat()
+        if not state.get("last_movie_real_search_at"):
+            state["last_movie_real_search_at"] = now.isoformat()
+        if not state.get("last_real_search_at"):
+            state["last_real_search_at"] = (
+                state.get("last_movie_real_search_at")
+            )
         state["last_movie_search_status"] = effective_status
-        state["last_movie_bridge_status"] = bridge_status
         state["last_movie_search_interval_days"] = interval_days
         state["next_movie_real_search_at"] = (
             now + datetime.timedelta(days=interval_days)
         ).isoformat()
+        state["retry_after"] = None
+        state["daily_failure_count"] = 0
+        state["last_skip_reason"] = None
+
+        if effective_status == "ok_empty":
+            cooldown_until = now + datetime.timedelta(
+                hours=self.MOVIE_NO_RESULT_COOLDOWN_HOURS
+            )
+            interval_until = self._parse_datetime(
+                state["next_movie_real_search_at"]
+            )
+            if interval_until and interval_until > cooldown_until:
+                cooldown_until = interval_until
+            next_release_date = self._parse_tmdb_date(
+                state.get("next_known_release_date")
+            )
+            if (
+                not state.get("released")
+                and next_release_date
+                and next_release_date > self.today()
+            ):
+                release_until = self._timezone().localize(
+                    datetime.datetime.combine(
+                        next_release_date,
+                        datetime.time.min,
+                    )
+                )
+                if release_until > cooldown_until:
+                    cooldown_until = release_until
+            state["no_result_cooldown_until"] = cooldown_until.isoformat()
+            state["force_refresh_pending"] = False
+        elif effective_status == "ok_matched":
+            state["no_result_cooldown_until"] = None
+            state["force_refresh_pending"] = False
 
         if not state.get("released") and effective_status == "ok_empty":
             state["leak_probe_done"] = True
@@ -755,7 +1043,12 @@ class ReleaseGateStore:
             f"电影 TMDB {tmdb_id} AYCLUB 真实查询已记录："
             f"status={effective_status}（桥接={bridge_status}），"
             f"连续无结果={state.get('movie_empty_count', 0)}，"
-            f"间隔={interval_days}天，下次允许={state['next_movie_real_search_at']}"
+            f"间隔={interval_days}天，下次允许={state['next_movie_real_search_at']}，"
+            f"force_refresh_pending={state.get('force_refresh_pending')}，"
+            f"last_real_search_at={state.get('last_real_search_at')}，"
+            f"retry_after={state.get('retry_after')}，"
+            f"daily_search_count={state.get('daily_search_count')}，"
+            f"no_result_cooldown_until={state.get('no_result_cooldown_until')}"
         )
         return True
 

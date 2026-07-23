@@ -7,6 +7,7 @@ AYCLUB Telegram 影视机器人桥接客户端。
 
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import requests
 
@@ -40,6 +41,9 @@ class AyclubClient:
         self.last_cache_only_requested: bool = False
         self.last_cache_only_honored: bool = False
         self.last_cache_only_supported: Optional[bool] = None
+        self.last_request_id: Optional[str] = None
+        self.last_origin_request_id: Optional[str] = None
+        self.last_late_reply: bool = False
 
         self._session = requests.Session()
 
@@ -156,6 +160,7 @@ class AyclubClient:
         episodes: Optional[List[int]] = None,
         force_refresh: bool = False,
         cache_only: bool = False,
+        request_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         查询 AYCLUB 机器人资源。
@@ -178,6 +183,9 @@ class AyclubClient:
         self.last_cache_only_requested = bool(cache_only)
         self.last_cache_only_honored = False
         self.last_cache_only_supported = None
+        self.last_request_id = str(request_id or uuid4().hex)
+        self.last_origin_request_id = None
+        self.last_late_reply = False
 
         if not self.is_ready:
             self.last_status = "disabled"
@@ -220,6 +228,7 @@ class AyclubClient:
             "max_pages": self.max_pages,
             "force_refresh": bool(force_refresh),
             "cache_only": bool(cache_only),
+            "request_id": self.last_request_id,
         }
 
         try:
@@ -229,6 +238,7 @@ class AyclubClient:
                 f"类型: {payload['media_type']}, "
                 f"季: {season}, "
                 f"集: {payload['episodes']}, "
+                f"request_id: {payload['request_id']}, "
                 f"强刷: {payload['force_refresh']}, "
                 f"仅缓存: {payload['cache_only']})"
             )
@@ -267,6 +277,17 @@ class AyclubClient:
             response.raise_for_status()
 
             data = response.json()
+            self.last_request_id = str(
+                data.get("request_id")
+                or self.last_request_id
+                or ""
+            ) or None
+            self.last_origin_request_id = str(
+                data.get("origin_request_id")
+                or data.get("request_id")
+                or ""
+            ) or None
+            self.last_late_reply = bool(data.get("late_reply"))
 
             if data.get("ok") is False:
                 error_message = str(
@@ -316,6 +337,8 @@ class AyclubClient:
             if not data.get("matched"):
                 if bridge_status == "cache_miss":
                     self.last_status = "cache_miss"
+                elif bridge_status == "pending_reply":
+                    self.last_status = "pending_reply"
                 else:
                     self.last_status = (
                         "cached_empty"
@@ -400,7 +423,10 @@ class AyclubClient:
                 f"强刷请求：{self.last_force_refresh_requested}，"
                 f"强刷生效：{self.last_force_refresh_honored}，"
                 f"仅缓存请求：{self.last_cache_only_requested}，"
-                f"仅缓存生效：{self.last_cache_only_honored}"
+                f"仅缓存生效：{self.last_cache_only_honored}，"
+                f"request_id：{self.last_request_id}，"
+                f"origin_request_id：{self.last_origin_request_id}，"
+                f"迟到回复：{self.last_late_reply}"
             )
 
             return results
@@ -425,6 +451,16 @@ class AyclubClient:
             status_code = getattr(error.response, "status_code", "?")
             self.last_status = "http_error"
             self.last_error = f"HTTP {status_code}: {body}"
+            try:
+                detail = error.response.json().get("detail")
+                if isinstance(detail, dict):
+                    self.last_request_id = str(
+                        detail.get("request_id")
+                        or self.last_request_id
+                        or ""
+                    ) or None
+            except Exception:
+                pass
 
             logger.error(
                 f"AYCLUB 查询失败：HTTP {status_code}，"
