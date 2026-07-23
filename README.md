@@ -1,6 +1,6 @@
 # P115StrgmSub - 115网盘订阅追更插件
 
-当前版本：**1.9.9**
+当前版本：**1.9.10**
 
 MoviePilot v2 插件。根据 MoviePilot 订阅、媒体库正式缺失状态和本地 STRM 实际文件，从 115 分享与 AYCLUB 结构化结果中选择目标资源。115 API 与选择性转存统一交给独立的 p115-openclaw 服务执行；插件不读取 115 Cookie、不安装 `p115client`，也不接管 MoviePilot 后续整理和订阅完成状态。
 
@@ -17,6 +17,14 @@ MoviePilot 订阅
   → STRM / 媒体库扫描
   → MoviePilot 正式缺失检查确认入库
 ```
+
+## 1.9.10 修复
+
+- **移除固定晚间窗口**：废弃旧 22:00–24:00 AYCLUB 真实搜索窗口，时间本身不再授予查询权限。
+- **显式来源门禁**：只有 Cron 当天最后一轮、`lifecycle_force_refresh`，以及明确的手动/API 全量任务可以真实搜索；订阅 `status` 修改等定向同步严格只读缓存。
+- **手动仍受每日去重**：明确手动/API 全量可以跨过 Cron 时间限制，但同一媒体当天已经真实搜索后继续返回 `cache_only_already_refreshed_today`。
+- **电影同步收紧**：电影 AYCLUB 发布门禁采用相同来源授权，定向生命周期任务不能借固定小时越权。
+- **既有边界不变**：已完成整季 ED2K 洗版仍只在 `scheduled_evening_refresh` 运行；生命周期首次强刷、白天 Cron 缓存轮次及 Bridge 1.5.3 协议保持不变。
 
 ## 1.9.9 更新
 
@@ -63,7 +71,7 @@ MoviePilot 订阅
 ## 版本组件
 
 ```text
-plugins.v2/p115strgmsub/        P115StrgmSub 1.9.9
+plugins.v2/p115strgmsub/        P115StrgmSub 1.9.10
 companion/tg-ayclub-bridge/     AYCLUB Bridge 1.5.3（独立配套项目，不在本仓库）
 ```
 

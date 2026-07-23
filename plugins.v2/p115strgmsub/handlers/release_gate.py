@@ -522,11 +522,6 @@ class ReleaseGateStore:
 
         return None
 
-    def _movie_in_refresh_window(self) -> bool:
-        """普通电影真实搜索只在本地时区 22:00-23:59 执行。"""
-        hour = self.now().hour
-        return 22 <= hour < 24
-
     def _movie_probe_due(
         self,
         state: Dict[str, Any],
@@ -608,12 +603,13 @@ class ReleaseGateStore:
         lifecycle_force_refresh: bool = False,
         scheduled_evening_refresh: bool = False,
         explicit_manual_force_refresh: bool = False,
+        query_origin: str = "unknown",
     ) -> Dict[str, Any]:
         """
         判断电影本次 AYCLUB 查询模式。
 
-        普通任务：白天严格只读缓存；固定晚间窗口或 cron 当天最后一轮
-        到期后按电影发布与退避门禁决定是否真实查询。
+        普通自动任务严格只读缓存；cron 当天最后一轮或明确手动/API
+        全量任务到期后按电影发布与退避门禁决定是否真实查询。
         新订阅、重新订阅、MP reset：允许立即强刷。
         """
         state = self.get_movie(tmdb_id)
@@ -749,7 +745,7 @@ class ReleaseGateStore:
                 interval_days=self._movie_search_interval_days(state),
             )
 
-        # 生命周期事件允许越过时间窗口，但仍受统一每日额度和失败退避约束。
+        # 生命周期事件有独立来源授权，但仍受统一每日额度和失败退避约束。
         if lifecycle_force_refresh:
             return self._movie_decision(
                 state=state,
@@ -762,24 +758,29 @@ class ReleaseGateStore:
                 interval_days=self._movie_search_interval_days(state),
             )
 
-        in_window = bool(
-            scheduled_evening_refresh or self._movie_in_refresh_window()
+        trigger_not_authorized = bool(
+            not scheduled_evening_refresh
+            and query_origin != "manual_or_api_full"
         )
-        evening_reason = (
+        real_search_authorized = bool(
+            scheduled_evening_refresh
+            or query_origin == "manual_or_api_full"
+        )
+        authorization_reason = (
             "scheduled_evening_refresh"
             if scheduled_evening_refresh
-            else "evening_window"
+            else "explicit_manual_refresh"
         )
 
         if state.get("released"):
             interval_days = self._movie_search_interval_days(state)
             search_due = self._movie_real_search_due(state)
-            if search_due and in_window:
+            if search_due and real_search_authorized:
                 return self._movie_decision(
                     state=state,
                     allow_ayclub=True,
                     probe_due=False,
-                    reason=f"released_search_due_{evening_reason}",
+                    reason=f"released_search_due_{authorization_reason}",
                     force_refresh=True,
                     cache_only=False,
                     real_search_due=True,
@@ -790,8 +791,8 @@ class ReleaseGateStore:
                 allow_ayclub=True,
                 probe_due=False,
                 reason=(
-                    "released_cache_only_outside_evening_window"
-                    if not in_window
+                    "released_cache_only_trigger_not_authorized"
+                    if trigger_not_authorized
                     else "released_cache_only_backoff_wait"
                 ),
                 force_refresh=False,
@@ -810,12 +811,12 @@ class ReleaseGateStore:
                 interval_days=14,
             )
 
-        if in_window:
+        if real_search_authorized:
             return self._movie_decision(
                 state=state,
                 allow_ayclub=True,
                 probe_due=True,
-                reason=f"unreleased_probe_due_{evening_reason}",
+                reason=f"unreleased_probe_due_{authorization_reason}",
                 force_refresh=True,
                 cache_only=False,
                 real_search_due=True,
@@ -826,7 +827,11 @@ class ReleaseGateStore:
             state=state,
             allow_ayclub=True,
             probe_due=True,
-            reason="unreleased_probe_due_cache_only_daytime",
+            reason=(
+                "unreleased_probe_due_cache_only_trigger_not_authorized"
+                if trigger_not_authorized
+                else "unreleased_probe_due_cache_only_daytime"
+            ),
             force_refresh=False,
             cache_only=True,
             real_search_due=True,

@@ -272,6 +272,25 @@ class CompletedSeasonWashFlowTest(unittest.TestCase):
         self.assertEqual(search.search_count, 0)
         self.assertEqual(calls, [])
 
+    def test_completed_wash_rejects_non_final_round(self):
+        handler, subscribe, _, search, calls, _ = self.make_handler()
+        history = []
+        details = []
+
+        count = handler.process_completed_tv_ed2k_wash(
+            subscribe=subscribe,
+            history=history,
+            transfer_details=details,
+            transferred_count=0,
+            scheduled_evening_refresh=False,
+        )
+
+        self.assertEqual(count, 0)
+        self.assertEqual(search.search_count, 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(history, [])
+        self.assertEqual(details, [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

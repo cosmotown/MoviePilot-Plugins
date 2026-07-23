@@ -52,7 +52,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.9"
+    plugin_version = "1.9.10"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -760,8 +760,11 @@ class P115StrgmSub(_PluginBase):
             logger.debug(f"判断最后一次任务：当前={run_start.strftime('%Y-%m-%d %H:%M')}, 下次={nxt.strftime('%Y-%m-%d %H:%M')}, 是否最后一次={is_last}")
             return is_last
         except Exception as e:
-            logger.warning(f"判断是否当天最后一次触发失败：{e}，按 23:00 兜底")
-            return run_start.hour == 23 and run_start.minute == 00
+            logger.warning(
+                f"判断是否当天最后一次触发失败：{e}，"
+                "拒绝授予 AYCLUB 自动真实搜索权限"
+            )
+            return False
 
     # ------------------ MoviePilot 生命周期联动 ------------------
 
@@ -1726,8 +1729,19 @@ class P115StrgmSub(_PluginBase):
         target_subscribe_ids: Optional[List[int]] = None,
         trigger_reason: str = "",
         scheduled_evening_refresh: bool = False,
+        query_origin: str = "unknown",
     ) -> bool:
         targeted_request = target_subscribe_ids is not None
+        # 双重校正触发来源，避免调用方误传后让定向或 Cron 任务冒充手动。
+        expected_query_origin = (
+            "targeted_lifecycle"
+            if targeted_request
+            else "scheduled_cron"
+            if trigger_reason == "scheduled_cron"
+            else "manual_or_api_full"
+        )
+        if query_origin != expected_query_origin:
+            query_origin = expected_query_origin
         target_ids: Set[int] = set()
         if targeted_request:
             for value in target_subscribe_ids or []:
@@ -1936,6 +1950,7 @@ class P115StrgmSub(_PluginBase):
                 transfer_details=transfer_details,
                 transferred_count=transferred_count,
                 scheduled_evening_refresh=scheduled_evening_refresh,
+                query_origin=query_origin,
             )
 
         # 处理剧集
@@ -1952,6 +1967,7 @@ class P115StrgmSub(_PluginBase):
                 transferred_count=transferred_count,
                 exclude_ids=exclude_ids,
                 scheduled_evening_refresh=scheduled_evening_refresh,
+                query_origin=query_origin,
             )
 
 
@@ -2022,12 +2038,20 @@ class P115StrgmSub(_PluginBase):
                 and trigger_reason == "scheduled_cron"
                 and is_last_run_today
             )
+            query_origin = (
+                "targeted_lifecycle"
+                if targeted_request
+                else "scheduled_cron"
+                if trigger_reason == "scheduled_cron"
+                else "manual_or_api_full"
+            )
             logger.info(
                 "同步入口："
                 f"trigger_reason={trigger_reason or 'manual_or_api'}，"
                 f"targeted={targeted_request}，"
                 f"is_last_run_today={is_last_run_today}，"
                 f"scheduled_evening_refresh={scheduled_evening_refresh}，"
+                f"query_origin={query_origin}，"
                 f"cron={self._cron or 'interval=8h'}"
             )
             if trigger_reason == "scheduled_cron":
@@ -2042,6 +2066,7 @@ class P115StrgmSub(_PluginBase):
                     target_subscribe_ids=target_subscribe_ids,
                     trigger_reason=trigger_reason,
                     scheduled_evening_refresh=scheduled_evening_refresh,
+                    query_origin=query_origin,
                 )
             except Exception as e:
                 logger.error(f"同步任务异常：{e}")

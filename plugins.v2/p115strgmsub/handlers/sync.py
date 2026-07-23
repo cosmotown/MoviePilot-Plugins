@@ -35,10 +35,6 @@ class SyncHandler:
     """同步处理器"""
 
     AYCLUB_DAILY_REFRESH_DATA_KEY = "ayclub_daily_refresh_state"
-    # 保留旧的 22:00-23:59 手动晚间窗口；配置 cron 的最后一轮另由
-    # scheduled_evening_refresh 显式授权，不再依赖这里的固定小时。
-    AYCLUB_REFRESH_WINDOW_START_HOUR = 22
-    AYCLUB_REFRESH_WINDOW_END_HOUR = 24
     AYCLUB_DAILY_REFRESH_RETENTION_DAYS = 30
     ED2K_DISPATCH_DATA_KEY = "ed2k_dispatch_history"
     ED2K_DISPATCH_TTL_HOURS = 24
@@ -932,26 +928,12 @@ class SyncHandler:
         except Exception:
             logger.warning(
                 f"MoviePilot 时区 {getattr(settings, 'TZ', None)!r} 无效，"
-                "AYCLUB 晚间窗口回退 Asia/Shanghai"
+                "AYCLUB 每日去重时区回退 Asia/Shanghai"
             )
             return pytz.timezone("Asia/Shanghai")
 
     def _ayclub_local_now(self) -> datetime.datetime:
         return datetime.datetime.now(tz=self._ayclub_local_timezone())
-
-    def _ayclub_in_refresh_window(
-        self,
-        now: Optional[datetime.datetime] = None,
-    ) -> bool:
-        current = now or self._ayclub_local_now()
-        if current.tzinfo is None:
-            current = self._ayclub_local_timezone().localize(current)
-        hour = int(current.hour)
-        return (
-            self.AYCLUB_REFRESH_WINDOW_START_HOUR
-            <= hour
-            < self.AYCLUB_REFRESH_WINDOW_END_HOUR
-        )
 
     def _load_ayclub_daily_refresh_state(self) -> Dict[str, Dict[str, Any]]:
         if not self._get_data:
@@ -1035,11 +1017,12 @@ class SyncHandler:
         season: int,
         lifecycle_force_refresh: bool,
         scheduled_evening_refresh: bool = False,
+        query_origin: str = "unknown",
     ) -> tuple[bool, bool, str]:
         """决定本轮 AYCLUB 是真实查询还是严格只读缓存。
 
-        cron 当天最后一轮优先于固定晚间窗口和每日去重；普通手动或
-        生命周期定向同步不会自动获得该标记。
+        只有 cron 当天最后一轮、生命周期强刷或明确手动/API 全量
+        来源可以真实查询；不再使用固定小时窗口判断权限。
         返回：(force_refresh, cache_only, reason)。
         """
         if scheduled_evening_refresh and tmdb_id:
@@ -1050,14 +1033,13 @@ class SyncHandler:
         if lifecycle_force_refresh:
             return True, False, "lifecycle_force_refresh"
 
-        now = self._ayclub_local_now()
         if not tmdb_id:
             return False, True, "cache_only_missing_tmdb"
 
-        in_legacy_evening_window = self._ayclub_in_refresh_window(now)
-        if not scheduled_evening_refresh and not in_legacy_evening_window:
-            return False, True, "cache_only_outside_evening_window"
+        if query_origin != "manual_or_api_full":
+            return False, True, "cache_only_trigger_not_authorized"
 
+        now = self._ayclub_local_now()
         if not self._ayclub_daily_refresh_due(
             tmdb_id=int(tmdb_id),
             season=int(season),
@@ -1065,7 +1047,7 @@ class SyncHandler:
         ):
             return False, True, "cache_only_already_refreshed_today"
 
-        return True, False, "evening_refresh_window"
+        return True, False, "explicit_manual_refresh"
 
     def _record_ayclub_query_if_real(
         self,
@@ -1332,6 +1314,7 @@ class SyncHandler:
         transfer_details: List[Dict[str, Any]],
         transferred_count: int,
         scheduled_evening_refresh: bool = False,
+        query_origin: str = "unknown",
     ) -> int:
         """
         处理单个电影订阅
@@ -1437,6 +1420,7 @@ class SyncHandler:
                     theatrical_date=getattr(mediainfo, "release_date", None),
                     lifecycle_force_refresh=lifecycle_force_refresh,
                     scheduled_evening_refresh=scheduled_evening_refresh,
+                    query_origin=query_origin,
                 )
             else:
                 logger.info(
@@ -2285,6 +2269,7 @@ class SyncHandler:
         transferred_count: int,
         exclude_ids: Set[int],
         scheduled_evening_refresh: bool = False,
+        query_origin: str = "unknown",
     ) -> int:
         """
         处理单个电视剧订阅
@@ -2724,6 +2709,7 @@ class SyncHandler:
                         season=int(season),
                         lifecycle_force_refresh=force_refresh,
                         scheduled_evening_refresh=scheduled_evening_refresh,
+                        query_origin=query_origin,
                     )
                     if ayclub_force_refresh:
                         logger.info(

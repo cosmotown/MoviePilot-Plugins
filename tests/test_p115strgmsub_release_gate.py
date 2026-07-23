@@ -286,6 +286,45 @@ class MovieLifecycleBackoffTest(unittest.TestCase):
             )
         )
 
+    def test_movie_real_search_requires_manual_full_authorization(self):
+        # 明确手动授权与旧 22:00-24:00 窗口无关，白天同样可用。
+        self.gate.set_time(13)
+
+        targeted = self.gate.evaluate_movie(
+            self.TMDB_ID,
+            query_origin="targeted_lifecycle",
+        )
+        self.assertFalse(targeted["force_refresh"])
+        self.assertTrue(targeted["cache_only"])
+        self.assertEqual(
+            targeted["reason"],
+            "released_cache_only_trigger_not_authorized",
+        )
+
+        manual_full = self.gate.evaluate_movie(
+            self.TMDB_ID,
+            query_origin="manual_or_api_full",
+        )
+        self.assertTrue(manual_full["force_refresh"])
+        self.assertFalse(manual_full["cache_only"])
+        self.assertEqual(
+            manual_full["reason"],
+            "released_search_due_explicit_manual_refresh",
+        )
+
+    def test_movie_targeted_lifecycle_force_still_has_priority(self):
+        self.gate.set_time(13)
+
+        decision = self.gate.evaluate_movie(
+            self.TMDB_ID,
+            lifecycle_force_refresh=True,
+            query_origin="targeted_lifecycle",
+        )
+
+        self.assertTrue(decision["force_refresh"])
+        self.assertFalse(decision["cache_only"])
+        self.assertEqual(decision["reason"], "lifecycle_force_refresh")
+
 
 if __name__ == "__main__":
     unittest.main()

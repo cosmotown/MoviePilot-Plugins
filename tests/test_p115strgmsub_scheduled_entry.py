@@ -165,11 +165,13 @@ class _ScheduledEntryHarness:
         target_subscribe_ids=None,
         trigger_reason="",
         scheduled_evening_refresh=False,
+        query_origin="unknown",
     ):
         self.sync_calls.append({
             "target_subscribe_ids": target_subscribe_ids,
             "trigger_reason": trigger_reason,
             "scheduled_evening_refresh": scheduled_evening_refresh,
+            "query_origin": query_origin,
         })
         return True
 
@@ -211,6 +213,7 @@ class ScheduledServiceEntryTest(unittest.TestCase):
                 "target_subscribe_ids": None,
                 "trigger_reason": "scheduled_cron",
                 "scheduled_evening_refresh": True,
+                "query_origin": "scheduled_cron",
             },
         )
         self.assertTrue(
@@ -231,10 +234,40 @@ class ScheduledServiceEntryTest(unittest.TestCase):
         self.assertFalse(
             self.plugin.sync_calls[-1]["scheduled_evening_refresh"]
         )
+        self.assertEqual(
+            self.plugin.sync_calls[-1]["query_origin"],
+            "scheduled_cron",
+        )
+
+    def test_changed_cron_moves_real_search_to_its_new_last_round(self):
+        self.plugin._cron = "30 6,14,22 * * *"
+
+        self.set_time(14, 30)
+        self.plugin.get_service()[0]["func"]()
+        daytime = self.plugin.sync_calls[-1]
+        self.assertFalse(daytime["scheduled_evening_refresh"])
+        self.assertEqual(daytime["query_origin"], "scheduled_cron")
+
+        self.set_time(22, 30)
+        self.plugin.get_service()[0]["func"]()
+        last_round = self.plugin.sync_calls[-1]
+        self.assertTrue(last_round["scheduled_evening_refresh"])
+        self.assertEqual(last_round["query_origin"], "scheduled_cron")
+
+    def test_invalid_cron_never_falls_back_to_fixed_2300_refresh(self):
+        self.plugin._cron = "invalid cron"
+        self.set_time(23)
+
+        service = self.plugin.get_service()[0]
+        self.assertEqual(service["trigger"], "interval")
+        service["func"]()
+
+        decision = self.plugin.sync_calls[-1]
+        self.assertFalse(decision["scheduled_evening_refresh"])
+        self.assertEqual(decision["query_origin"], "scheduled_cron")
 
     def test_tv_last_round_is_real_search_and_daytime_is_cache_only(self):
         self.plugin._ayclub_local_now = lambda: _FrozenDateTime.current
-        self.plugin._ayclub_in_refresh_window = lambda now: False
         self.plugin._ayclub_daily_refresh_due = lambda **kwargs: True
 
         evening = self.plugin._ayclub_tv_query_mode(
@@ -242,12 +275,14 @@ class ScheduledServiceEntryTest(unittest.TestCase):
             season=1,
             lifecycle_force_refresh=False,
             scheduled_evening_refresh=True,
+            query_origin="scheduled_cron",
         )
         daytime = self.plugin._ayclub_tv_query_mode(
             tmdb_id=123456,
             season=1,
             lifecycle_force_refresh=False,
             scheduled_evening_refresh=False,
+            query_origin="scheduled_cron",
         )
 
         self.assertEqual(
@@ -256,7 +291,7 @@ class ScheduledServiceEntryTest(unittest.TestCase):
         )
         self.assertEqual(
             daytime,
-            (False, True, "cache_only_outside_evening_window"),
+            (False, True, "cache_only_trigger_not_authorized"),
         )
 
     def test_manual_and_onlyonce_sync_do_not_impersonate_cron(self):
@@ -270,6 +305,14 @@ class ScheduledServiceEntryTest(unittest.TestCase):
         )
         self.assertFalse(
             self.plugin.sync_calls[-1]["scheduled_evening_refresh"]
+        )
+        self.assertEqual(
+            self.plugin.sync_calls[-2]["query_origin"],
+            "manual_or_api_full",
+        )
+        self.assertEqual(
+            self.plugin.sync_calls[-1]["query_origin"],
+            "manual_or_api_full",
         )
 
     def test_targeted_lifecycle_sync_does_not_impersonate_last_round(self):
@@ -286,6 +329,10 @@ class ScheduledServiceEntryTest(unittest.TestCase):
         self.assertFalse(
             self.plugin.sync_calls[-1]["scheduled_evening_refresh"]
         )
+        self.assertEqual(
+            self.plugin.sync_calls[-1]["query_origin"],
+            "targeted_lifecycle",
+        )
 
     def test_interval_fallback_keeps_trigger_kwargs_and_uses_wrapper(self):
         self.plugin._cron_interval_ge_min_hours = (
@@ -299,6 +346,119 @@ class ScheduledServiceEntryTest(unittest.TestCase):
             service["func"].__func__,
             _ScheduledEntryHarness.scheduled_sync_subscribes,
         )
+
+    def _configure_tv_query_gate(self, *, due=True):
+        self.plugin._ayclub_local_now = lambda: _FrozenDateTime.current
+        self.plugin._ayclub_daily_refresh_due = lambda **kwargs: due
+
+    def test_2346_status_targeted_sync_is_cache_only(self):
+        self.set_time(23, 46)
+        self._configure_tv_query_gate()
+
+        self.plugin.sync_subscribes(
+            target_subscribe_ids=[312],
+            trigger_reason="订阅修改 312/status",
+        )
+        origin = self.plugin.sync_calls[-1]
+        decision = self.plugin._ayclub_tv_query_mode(
+            tmdb_id=123456,
+            season=1,
+            lifecycle_force_refresh=False,
+            scheduled_evening_refresh=origin["scheduled_evening_refresh"],
+            query_origin=origin["query_origin"],
+        )
+
+        self.assertEqual(
+            decision,
+            (False, True, "cache_only_trigger_not_authorized"),
+        )
+
+    def test_manual_full_sync_is_explicitly_authorized(self):
+        self.set_time(23, 46)
+        self._configure_tv_query_gate()
+
+        self.plugin.sync_subscribes()
+        origin = self.plugin.sync_calls[-1]
+        decision = self.plugin._ayclub_tv_query_mode(
+            tmdb_id=123456,
+            season=1,
+            lifecycle_force_refresh=False,
+            scheduled_evening_refresh=origin["scheduled_evening_refresh"],
+            query_origin=origin["query_origin"],
+        )
+
+        self.assertEqual(
+            decision,
+            (True, False, "explicit_manual_refresh"),
+        )
+
+    def test_daytime_manual_full_does_not_depend_on_old_window(self):
+        self.set_time(13)
+        self._configure_tv_query_gate()
+
+        decision = self.plugin._ayclub_tv_query_mode(
+            tmdb_id=123456,
+            season=1,
+            lifecycle_force_refresh=False,
+            scheduled_evening_refresh=False,
+            query_origin="manual_or_api_full",
+        )
+
+        self.assertEqual(
+            decision,
+            (True, False, "explicit_manual_refresh"),
+        )
+
+    def test_daytime_lifecycle_force_refresh_remains_authorized(self):
+        self.set_time(13)
+        self._configure_tv_query_gate()
+
+        decision = self.plugin._ayclub_tv_query_mode(
+            tmdb_id=123456,
+            season=1,
+            lifecycle_force_refresh=True,
+            scheduled_evening_refresh=False,
+            query_origin="targeted_lifecycle",
+        )
+
+        self.assertEqual(
+            decision,
+            (True, False, "lifecycle_force_refresh"),
+        )
+
+    def test_same_media_second_manual_query_uses_daily_cache(self):
+        self.set_time(23, 46)
+        self._configure_tv_query_gate(due=False)
+
+        decision = self.plugin._ayclub_tv_query_mode(
+            tmdb_id=123456,
+            season=1,
+            lifecycle_force_refresh=False,
+            scheduled_evening_refresh=False,
+            query_origin="manual_or_api_full",
+        )
+
+        self.assertEqual(
+            decision,
+            (False, True, "cache_only_already_refreshed_today"),
+        )
+
+    def test_different_media_status_targeted_sync_is_also_cache_only(self):
+        self.set_time(23, 46)
+        self._configure_tv_query_gate()
+
+        for tmdb_id in (123456, 654321):
+            decision = self.plugin._ayclub_tv_query_mode(
+                tmdb_id=tmdb_id,
+                season=1,
+                lifecycle_force_refresh=False,
+                scheduled_evening_refresh=False,
+                query_origin="targeted_lifecycle",
+            )
+            self.assertEqual(
+                decision,
+                (False, True, "cache_only_trigger_not_authorized"),
+            )
 
 
 if __name__ == "__main__":

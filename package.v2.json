@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合 MoviePilot 正式缺失状态，自动处理 115 分享及 AYCLUB ED2K 资源。",
     "labels": "订阅,115网盘,STRM",
-    "version": "1.9.9",
+    "version": "1.9.10",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.9.10": "修复 AYCLUB 触发来源越权：彻底移除旧22:00-24:00固定真实搜索窗口，新增 query_origin 来源门禁；只有 Cron 当天最后一轮、生命周期强刷及明确手动/API全量任务可获得真实搜索权限，订阅status等定向同步严格只读缓存；手动全量仍受同媒体每日去重，电影门禁同步修复，Bridge 1.5.3不变。",
       "v1.9.9": "新增已完成电视剧完整统一 ED2K 整季洗版：仅 Cron 当天最后一轮检查最近30天由 MoviePilot 正式完成且开启洗版的订阅；真实文件名季集覆盖必须完整、连续、无重复且命名指纹一致，才按单集批量提交 OpenClaw/p115；加入整包指纹、质量分与部分失败持久化去重，容量不足不启动批次，不删除现有媒体，Bridge 1.5.3 协议保持不变。",
       "v1.9.8": "修复 MoviePilot 调度服务未可靠传递 trigger_reason，导致配置 Cron 的每日最后一轮仍只读 AYCLUB 缓存：Cron 与 interval 回退统一注册无参数定时入口，显式标记 scheduled_cron；最后一轮恢复 scheduled_evening_refresh 真实搜索，白天、手动和生命周期定向同步行为保持不变。",
       "v1.9.7": "修复 lifecycle_force_refresh 在 AYCLUB 504 后无限重试：电影普通、生命周期与定时晚间真实搜索统一按 media_key 每日限流，失败写入 6 小时 retry_after 且同日不重复发送 Telegram；成功无资源清除生命周期强刷并进入至少 24 小时冷却，未上映影片使用更长冷却；增加 request_id、迟到回复缓存状态及完整门禁日志。",
