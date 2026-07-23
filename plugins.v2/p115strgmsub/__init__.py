@@ -7,7 +7,8 @@ import hashlib
 import math
 from pathlib import Path
 from threading import Lock
-from typing import Optional, Any, List, Dict, Tuple
+from types import SimpleNamespace
+from typing import Optional, Any, List, Dict, Tuple, Set
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,6 +21,7 @@ from app.chain.subscribe import SubscribeChain
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
 from app.db.models.site import Site
+from app.db.models.subscribehistory import SubscribeHistory
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, ChainEventType, MediaType, NotificationType
@@ -50,7 +52,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.8"
+    plugin_version = "1.9.9"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -154,6 +156,21 @@ class P115StrgmSub(_PluginBase):
     _MIN_INTERVAL_HOURS: int = 8
     _PT_GATE_RECHECK_SECONDS: int = 300
     _PT_GATE_MAX_WAIT_MINUTES: int = 90
+    _COMPLETED_ED2K_WASH_MAX_PER_RUN: int = 5
+    _COMPLETED_ED2K_WASH_SNAPSHOT_FIELDS: Tuple[str, ...] = (
+        "name",
+        "year",
+        "type",
+        "tmdbid",
+        "doubanid",
+        "season",
+        "total_episode",
+        "start_episode",
+        "best_version",
+        "quality",
+        "resolution",
+        "effect",
+    )
 
     # ------------------ 调度器 ------------------
 
@@ -1639,6 +1656,71 @@ class P115StrgmSub(_PluginBase):
     # 必备：_do_sync（返回 bool）
     # ======================================================================
 
+    def _resolve_completed_wash_subscribe(
+        self,
+        db: Any,
+        completed_record: Dict[str, Any],
+    ) -> Optional[Any]:
+        """恢复已完成订阅；MoviePilot 完成时通常已删除活动订阅行。"""
+        try:
+            subscribe_id = int(completed_record.get("subscribe_id"))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        # 兼容保留完成行的宿主版本。
+        subscribe = SubscribeOper(db=db).get(subscribe_id)
+        if subscribe:
+            return subscribe
+
+        # 1.9.9 起完成事件会把洗版所需字段保存在生命周期快照中。
+        if all(
+            field in completed_record
+            for field in (
+                "name",
+                "type",
+                "tmdbid",
+                "total_episode",
+                "best_version",
+            )
+        ):
+            snapshot = {
+                field: completed_record.get(field)
+                for field in self._COMPLETED_ED2K_WASH_SNAPSHOT_FIELDS
+            }
+            return SimpleNamespace(id=subscribe_id, **snapshot)
+
+        # 兼容 1.9.8 已完成记录：MP 会先写订阅历史再删除活动行。
+        try:
+            tmdb_id = int(completed_record.get("tmdbid"))
+            season = int(completed_record.get("season") or 1)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+        history = (
+            db.query(SubscribeHistory)
+            .filter(
+                SubscribeHistory.type == MediaType.TV.value,
+                SubscribeHistory.tmdbid == tmdb_id,
+                SubscribeHistory.season == season,
+            )
+            .order_by(
+                SubscribeHistory.date.desc(),
+                SubscribeHistory.id.desc(),
+            )
+            .first()
+        )
+        if not history:
+            return None
+
+        snapshot = {
+            field: getattr(history, field, None)
+            for field in self._COMPLETED_ED2K_WASH_SNAPSHOT_FIELDS
+        }
+        logger.info(
+            f"已完成订阅 {subscribe_id} 已从 MoviePilot 订阅历史恢复洗版快照"
+        )
+        return SimpleNamespace(id=subscribe_id, **snapshot)
+
     def _do_sync(
         self,
         target_subscribe_ids: Optional[List[int]] = None,
@@ -1740,6 +1822,55 @@ class P115StrgmSub(_PluginBase):
         self._init_lifecycle_store()
         self._lifecycle_store.reconcile_active(all_subscribes or [])
 
+        completed_wash_subscribes: List[Any] = []
+        if not targeted_request and scheduled_evening_refresh:
+            completed_ids = set(
+                self._lifecycle_store.completed_subscription_ids(
+                    max_age_days=30
+                )
+            )
+            completed_records = (
+                self._lifecycle_store.completed_subscription_records(
+                    max_age_days=30
+                )
+            )
+            if completed_records:
+                with SessionFactory() as db:
+                    for completed_record in completed_records:
+                        if completed_record.get("subscribe_id") not in completed_ids:
+                            continue
+                        subscribe = self._resolve_completed_wash_subscribe(
+                            db,
+                            completed_record,
+                        )
+                        if not subscribe:
+                            continue
+                        if subscribe.type != MediaType.TV.value:
+                            continue
+                        if not bool(getattr(subscribe, "best_version", False)):
+                            continue
+                        try:
+                            total_episode = int(
+                                getattr(subscribe, "total_episode", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            total_episode = 0
+                        if total_episode <= 0:
+                            continue
+                        if self._is_subscribe_excluded(int(subscribe.id)):
+                            continue
+                        completed_wash_subscribes.append(subscribe)
+                        if (
+                            len(completed_wash_subscribes)
+                            >= self._COMPLETED_ED2K_WASH_MAX_PER_RUN
+                        ):
+                            break
+                if completed_wash_subscribes:
+                    logger.info(
+                        "当天最后一轮发现可检查的已完成整季 ED2K 洗版订阅："
+                        f"{[int(item.id) for item in completed_wash_subscribes]}"
+                    )
+
         if targeted_request:
             subscribes = [
                 subscribe for subscribe in (all_subscribes or [])
@@ -1764,8 +1895,8 @@ class P115StrgmSub(_PluginBase):
         else:
             subscribes = all_subscribes or []
 
-        if not subscribes:
-            logger.info("无订阅数据")
+        if not subscribes and not completed_wash_subscribes:
+            logger.info("无活动订阅或到期的已完成整季洗版任务")
             if self._notify and not targeted_request:
                 self.post_message(
                     mtype=NotificationType.Plugin,
@@ -1777,7 +1908,11 @@ class P115StrgmSub(_PluginBase):
         tv_subscribes = [s for s in subscribes if s.type == MediaType.TV.value]
         movie_subscribes = [s for s in subscribes if s.type == MediaType.MOVIE.value]
 
-        if not tv_subscribes and not movie_subscribes:
+        if (
+            not tv_subscribes
+            and not movie_subscribes
+            and not completed_wash_subscribes
+        ):
             logger.info("无电影/剧集订阅")
             return True
 
@@ -1817,6 +1952,22 @@ class P115StrgmSub(_PluginBase):
                 transferred_count=transferred_count,
                 exclude_ids=exclude_ids,
                 scheduled_evening_refresh=scheduled_evening_refresh,
+            )
+
+
+        # 仅 Cron 当天最后一轮检查最近完成且开启洗版的电视剧。
+        # 不把它们重新标记为活动订阅，也不参与普通缺集链路。
+        for subscribe in completed_wash_subscribes:
+            if global_vars.is_system_stopped:
+                break
+            transferred_count = (
+                self._sync_handler.process_completed_tv_ed2k_wash(
+                    subscribe=subscribe,
+                    history=history,
+                    transfer_details=transfer_details,
+                    transferred_count=transferred_count,
+                    scheduled_evening_refresh=scheduled_evening_refresh,
+                )
             )
 
         if skipped_count:

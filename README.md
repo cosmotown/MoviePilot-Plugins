@@ -1,6 +1,6 @@
 # P115StrgmSub - 115网盘订阅追更插件
 
-当前版本：**1.9.8**
+当前版本：**1.9.9**
 
 MoviePilot v2 插件。根据 MoviePilot 订阅、媒体库正式缺失状态和本地 STRM 实际文件，从 115 分享与 AYCLUB 结构化结果中选择目标资源。115 API 与选择性转存统一交给独立的 p115-openclaw 服务执行；插件不读取 115 Cookie、不安装 `p115client`，也不接管 MoviePilot 后续整理和订阅完成状态。
 
@@ -18,6 +18,14 @@ MoviePilot 订阅
   → MoviePilot 正式缺失检查确认入库
 ```
 
+## 1.9.9 更新
+
+- **完成订阅整季洗版**：仅在 Cron 当天最后一轮检查最近 30 天内由 MoviePilot 正式完成、仍开启 `best_version` 的电视剧订阅；兼容从完成事件快照和 MoviePilot 订阅历史恢复已删除的活动订阅信息。
+- **28 集 ED2K 完整门禁**：只接受同一真实文件名指纹、集号连续、无缺集、无重复且季号一致的完整整季资源；以实际 ED2K 文件名为季集判断依据，不把分组标题或 `2160p` 等数字混入集号。
+- **安全批量提交**：提交前必须为整批预留容量；按单集提交并记录已接受集号，部分失败时只重试失败集，完整批次指纹已提交后不重复发送。
+- **职责边界不变**：不重新激活或删除已完成订阅，不删除现有媒体，不影响白天只读缓存、电影退避、电视剧播出门禁、普通订阅完成过滤和选择性转存逻辑。
+- **Bridge 保持独立**：兼容 AYCLUB Bridge 1.5.3 的 ED2K 文件名元数据，不把桥接源码复制进本仓库。
+
 ## 1.9.8 修复
 
 - **修复最后一轮误读缓存**：MoviePilot 自动服务改用无参数专用入口，在入口内显式标记 `scheduled_cron`，不再依赖调度层传递业务 `kwargs`。
@@ -33,7 +41,7 @@ MoviePilot 订阅
 - **迟到回复消费**：插件请求携带 `request_id`，识别桥接返回的原始请求 ID 与迟到回复缓存；迟到的空结果可在后续 cache-only 查询中直接消费并清除强刷标记。
 - **可观测日志**：门禁和结果日志增加 `force_refresh_pending`、`last_real_search_at`、`retry_after`、`daily_search_count`、`no_result_cooldown_until` 和跳过原因。
 
-配套 AYCLUB Bridge 1.5.1 负责识别明确无资源终态、关联请求回复并缓存迟到结果。本次 1.9.8 不修改桥接器或其协议字段。
+配套 AYCLUB Bridge 1.5.3 负责识别明确无资源终态、关联请求回复、缓存迟到结果，并以 ED2K 文件名提供准确的单集元数据。1.9.9 不修改桥接器源码或其协议字段。
 
 ## 1.9.6 修复
 
@@ -55,8 +63,8 @@ MoviePilot 订阅
 ## 版本组件
 
 ```text
-plugins.v2/p115strgmsub/        P115StrgmSub 1.9.8
-companion/tg-ayclub-bridge/     AYCLUB Bridge 1.5.1（独立配套项目，不在本仓库）
+plugins.v2/p115strgmsub/        P115StrgmSub 1.9.9
+companion/tg-ayclub-bridge/     AYCLUB Bridge 1.5.3（独立配套项目，不在本仓库）
 ```
 
 桥接源码不应复制进 MoviePilot 插件目录。它应覆盖桥接项目原有 `bridge.py`，并继续使用本机私有 Session 与环境变量。

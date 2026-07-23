@@ -28,6 +28,7 @@ from .search import SearchHandler
 from .subscribe import SubscribeHandler
 from .release_gate import ReleaseGateStore
 from .lifecycle import LifecycleStore
+from .season_wash import select_complete_uniform_ed2k_pack
 
 
 class SyncHandler:
@@ -44,6 +45,11 @@ class SyncHandler:
     ED2K_MIGRATION_DATA_KEY = "ed2k_dispatch_migration_v189"
     ED2K_EPISODE_MIGRATION_DATA_KEY = "ed2k_episode_mapping_migration_v190"
     ED2K_CONTRACT_MIGRATION_DATA_KEY = "ed2k_contract_migration_v192"
+    COMPLETED_ED2K_WASH_DATA_KEY = "completed_ed2k_season_wash_state"
+    COMPLETED_ED2K_WASH_NO_PACK_RETRY_DAYS = 3
+    COMPLETED_ED2K_WASH_PARTIAL_RETRY_DAYS = 1
+    COMPLETED_ED2K_WASH_RECHECK_DAYS = 30
+    COMPLETED_ED2K_WASH_RETENTION_DAYS = 180
 
     def __init__(
         self,
@@ -1796,6 +1802,479 @@ class SyncHandler:
         except Exception as e:
             logger.error(f"处理电影订阅 {subscribe.name} 出错：{str(e)}")
 
+        return transferred_count
+
+
+    def _load_completed_ed2k_wash_state(self) -> Dict[str, Dict[str, Any]]:
+        if not self._get_data:
+            return {}
+        try:
+            raw = self._get_data(self.COMPLETED_ED2K_WASH_DATA_KEY) or {}
+        except Exception as error:
+            logger.warning(f"读取已完成整季 ED2K 洗版状态失败：{error}")
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        retained: Dict[str, Dict[str, Any]] = {}
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            updated_at = self._parse_utc_datetime(value.get("updated_at"))
+            if not updated_at:
+                continue
+            age_days = (now - updated_at).total_seconds() / 86400
+            if age_days <= self.COMPLETED_ED2K_WASH_RETENTION_DAYS:
+                retained[str(key)] = value
+        if len(retained) != len(raw):
+            self._save_completed_ed2k_wash_state(retained)
+        return retained
+
+    def _save_completed_ed2k_wash_state(
+        self,
+        state: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not self._save_data:
+            return
+        try:
+            self._save_data(self.COMPLETED_ED2K_WASH_DATA_KEY, state)
+        except Exception as error:
+            logger.warning(f"保存已完成整季 ED2K 洗版状态失败：{error}")
+
+    @staticmethod
+    def _completed_ed2k_wash_key(tmdb_id: int, season: int) -> str:
+        return f"tv:{int(tmdb_id)}:S{int(season)}"
+
+    def _completed_ed2k_wash_due(
+        self,
+        *,
+        tmdb_id: int,
+        season: int,
+    ) -> bool:
+        key = self._completed_ed2k_wash_key(tmdb_id, season)
+        record = self._load_completed_ed2k_wash_state().get(key) or {}
+        next_check = self._parse_utc_datetime(record.get("next_check_at"))
+        return not next_check or datetime.datetime.now(
+            datetime.timezone.utc
+        ) >= next_check
+
+    @staticmethod
+    def _positive_int_list(values: Optional[List[int]]) -> List[int]:
+        result: Set[int] = set()
+        for value in values or []:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                result.add(number)
+        return sorted(result)
+
+    def _record_completed_ed2k_wash(
+        self,
+        *,
+        tmdb_id: int,
+        season: int,
+        status: str,
+        retry_days: int,
+        fingerprint: Optional[str] = None,
+        signature_ref: Optional[str] = None,
+        score: Optional[int] = None,
+        expected_episodes: Optional[List[int]] = None,
+        accepted_episodes: Optional[List[int]] = None,
+        failed_episodes: Optional[List[int]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        state = self._load_completed_ed2k_wash_state()
+        key = self._completed_ed2k_wash_key(tmdb_id, season)
+        old = state.get(key) or {}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        record = {
+            **old,
+            "tmdb_id": int(tmdb_id),
+            "season": int(season),
+            "status": str(status),
+            "fingerprint": (
+                old.get("fingerprint")
+                if fingerprint is None
+                else fingerprint
+            ),
+            "signature_ref": (
+                old.get("signature_ref")
+                if signature_ref is None
+                else signature_ref
+            ),
+            "score": (
+                int(old.get("score") or 0)
+                if score is None
+                else int(score or 0)
+            ),
+            "expected_episodes": (
+                self._positive_int_list(old.get("expected_episodes"))
+                if expected_episodes is None
+                else self._positive_int_list(expected_episodes)
+            ),
+            "accepted_episodes": (
+                self._positive_int_list(old.get("accepted_episodes"))
+                if accepted_episodes is None
+                else self._positive_int_list(accepted_episodes)
+            ),
+            "failed_episodes": (
+                self._positive_int_list(old.get("failed_episodes"))
+                if failed_episodes is None
+                else self._positive_int_list(failed_episodes)
+            ),
+            "diagnostics": dict(diagnostics or {}),
+            "last_checked_at": now.isoformat(),
+            "next_check_at": (
+                now + datetime.timedelta(days=max(1, int(retry_days)))
+            ).isoformat(),
+            "updated_at": now.isoformat(),
+        }
+        if status == "submitted":
+            record["submitted_at"] = now.isoformat()
+        state[key] = record
+        self._save_completed_ed2k_wash_state(state)
+        return record
+
+    def process_completed_tv_ed2k_wash(
+        self,
+        *,
+        subscribe: Any,
+        history: List[dict],
+        transfer_details: List[Dict[str, Any]],
+        transferred_count: int,
+        scheduled_evening_refresh: bool = False,
+    ) -> int:
+        # 只对正式完成且开启洗版的电视剧检查完整统一 ED2K 整季批次。
+        if not scheduled_evening_refresh:
+            return transferred_count
+        if not bool(getattr(subscribe, "best_version", False)):
+            return transferred_count
+        if getattr(subscribe, "type", None) != MediaType.TV.value:
+            return transferred_count
+
+        try:
+            subscribe_id = int(subscribe.id)
+            tmdb_id = int(subscribe.tmdbid)
+            season = int(subscribe.season or 1)
+            total_episode = int(subscribe.total_episode or 0)
+            start_episode = max(1, int(subscribe.start_episode or 1))
+        except (TypeError, ValueError, AttributeError):
+            logger.warning("已完成整季 ED2K 洗版订阅缺少有效 ID/TMDB/季集信息，跳过")
+            return transferred_count
+
+        if total_episode < start_episode:
+            return transferred_count
+        expected = list(range(start_episode, total_episode + 1))
+        if not self._completed_ed2k_wash_due(
+            tmdb_id=tmdb_id,
+            season=season,
+        ):
+            logger.info(
+                f"已完成整季 ED2K 洗版尚未到复查时间："
+                f"TMDB={tmdb_id}, S{season}"
+            )
+            return transferred_count
+
+        state_key = self._completed_ed2k_wash_key(tmdb_id, season)
+        old = self._load_completed_ed2k_wash_state().get(state_key) or {}
+        old_status = str(old.get("status") or "")
+
+        meta = MetaInfo(subscribe.name)
+        meta.year = subscribe.year
+        meta.begin_season = season
+        meta.type = MediaType.TV
+        mediainfo: MediaInfo = self._chain.recognize_media(
+            meta=meta,
+            mtype=MediaType.TV,
+            tmdbid=tmdb_id,
+            doubanid=subscribe.doubanid,
+            cache=True,
+        )
+        if not mediainfo:
+            self._record_completed_ed2k_wash(
+                tmdb_id=tmdb_id,
+                season=season,
+                status=(
+                    "submitted"
+                    if old_status == "submitted"
+                    else "recognize_failed"
+                ),
+                retry_days=self.COMPLETED_ED2K_WASH_NO_PACK_RETRY_DAYS,
+                expected_episodes=expected,
+                diagnostics={"last_check_result": "recognize_failed"},
+            )
+            return transferred_count
+
+        self._search_handler.reset_ayclub_status()
+        request_id = uuid.uuid4().hex
+        logger.info(
+            f"开始检查已完成电视剧完整统一 ED2K 洗版候选："
+            f"{mediainfo.title_year} S{season}，"
+            f"期望=E{expected[0]:02d}-E{expected[-1]:02d}"
+        )
+        resources = self._search_handler.search_single_source(
+            source="ayclub",
+            mediainfo=mediainfo,
+            media_type=MediaType.TV,
+            season=season,
+            episodes=None,
+            force_refresh=True,
+            cache_only=False,
+            request_id=request_id,
+        )
+        self._record_ayclub_query_if_real(
+            tmdb_id=tmdb_id,
+            season=season,
+            reason="completed_season_ed2k_wash",
+        )
+
+        ed2k_resources = [
+            item for item in resources or []
+            if isinstance(item, dict) and self._is_ed2k_resource(item)
+        ]
+        subscribe_filter = SubscribeFilter(
+            quality=subscribe.quality,
+            resolution=subscribe.resolution,
+            effect=subscribe.effect,
+            strict=False,
+        )
+        eligible_resources: List[Dict[str, Any]] = []
+        scores: Dict[str, int] = {}
+        for resource in ed2k_resources:
+            resource_title = str(resource.get("title") or "")
+            matched = True
+            score = 0
+            if subscribe_filter.has_filters():
+                try:
+                    matched, score = subscribe_filter.match(resource_title)
+                except Exception:
+                    matched, score = False, 0
+            if not matched:
+                continue
+            source_ref = self._ed2k_source_ref(str(resource.get("url") or ""))
+            scores[source_ref] = int(score or 0)
+            eligible_resources.append(resource)
+
+        pack, diagnostics = select_complete_uniform_ed2k_pack(
+            eligible_resources,
+            season=season,
+            expected_episodes=expected,
+            score_func=lambda item: scores.get(
+                self._ed2k_source_ref(str(item.get("url") or "")),
+                0,
+            ),
+        )
+        if not pack:
+            self._record_completed_ed2k_wash(
+                tmdb_id=tmdb_id,
+                season=season,
+                status=(
+                    "submitted"
+                    if old_status == "submitted"
+                    else "no_complete_uniform_pack"
+                ),
+                retry_days=self.COMPLETED_ED2K_WASH_NO_PACK_RETRY_DAYS,
+                expected_episodes=expected,
+                diagnostics={
+                    "last_check_result": "no_complete_uniform_pack",
+                    "input_count": diagnostics.get("input_count"),
+                    "valid_count": diagnostics.get("valid_count"),
+                    "group_count": diagnostics.get("group_count"),
+                    "complete_group_count": diagnostics.get(
+                        "complete_group_count"
+                    ),
+                },
+            )
+            logger.info(
+                f"未发现完整统一 ED2K 整季洗版包："
+                f"{mediainfo.title_year} S{season}，"
+                f"有效ED2K={diagnostics.get('valid_count', 0)}，"
+                f"命名组={diagnostics.get('group_count', 0)}"
+            )
+            return transferred_count
+
+        same_fingerprint = old.get("fingerprint") == pack.fingerprint
+        try:
+            old_score = int(old.get("score") or 0)
+        except (TypeError, ValueError):
+            old_score = 0
+
+        if same_fingerprint and old_status == "submitted":
+            self._record_completed_ed2k_wash(
+                tmdb_id=tmdb_id,
+                season=season,
+                status="submitted",
+                retry_days=self.COMPLETED_ED2K_WASH_RECHECK_DAYS,
+                fingerprint=pack.fingerprint,
+                signature_ref=pack.signature_ref,
+                score=pack.score,
+                expected_episodes=expected,
+                accepted_episodes=expected,
+            )
+            logger.info(
+                f"完整整季 ED2K 洗版包已提交过，跳过重复批次："
+                f"{mediainfo.title_year} S{season}，pack={pack.signature_ref}"
+            )
+            return transferred_count
+
+        if (
+            old.get("fingerprint")
+            and not same_fingerprint
+            and old_status == "submitted"
+            and pack.score <= old_score
+        ):
+            self._record_completed_ed2k_wash(
+                tmdb_id=tmdb_id,
+                season=season,
+                status="submitted",
+                retry_days=self.COMPLETED_ED2K_WASH_RECHECK_DAYS,
+                fingerprint=old.get("fingerprint"),
+                signature_ref=old.get("signature_ref"),
+                score=old_score,
+                expected_episodes=expected,
+                accepted_episodes=old.get("accepted_episodes") or expected,
+                diagnostics={
+                    "last_check_result": "lower_or_equal_quality",
+                    "candidate_signature_ref": pack.signature_ref,
+                },
+            )
+            logger.info(
+                f"新完整整季 ED2K 候选分数未高于已提交版本，跳过："
+                f"{mediainfo.title_year} S{season}，"
+                f"当前={old_score}，候选={pack.score}"
+            )
+            return transferred_count
+
+        accepted_before: Set[int] = set()
+        if same_fingerprint:
+            accepted_before = {
+                int(value)
+                for value in (old.get("accepted_episodes") or [])
+            }
+        to_submit = [
+            episode for episode in expected if episode not in accepted_before
+        ]
+        remaining_capacity = self._max_transfer_per_sync - transferred_count
+        if len(to_submit) > remaining_capacity:
+            self._record_completed_ed2k_wash(
+                tmdb_id=tmdb_id,
+                season=season,
+                status="capacity_wait",
+                retry_days=self.COMPLETED_ED2K_WASH_PARTIAL_RETRY_DAYS,
+                fingerprint=pack.fingerprint,
+                signature_ref=pack.signature_ref,
+                score=pack.score,
+                expected_episodes=expected,
+                accepted_episodes=sorted(accepted_before),
+                failed_episodes=to_submit,
+                diagnostics={"remaining_capacity": remaining_capacity},
+            )
+            logger.warning(
+                f"完整整季 ED2K 洗版要求原子预留容量，当前不足："
+                f"{mediainfo.title_year} S{season}，"
+                f"待提交={len(to_submit)}，剩余额度={remaining_capacity}"
+            )
+            return transferred_count
+
+        media_key = self._lifecycle.media_key_from_subscribe(subscribe)
+        accepted = set(accepted_before)
+        newly_queued: List[int] = []
+        failed: List[int] = []
+        for episode in to_submit:
+            resource = pack.episode_resources[episode]
+            ok, duplicate = self._dispatch_ed2k_resource(
+                subscribe=subscribe,
+                media_key=media_key,
+                resource=resource,
+                mediainfo=mediainfo,
+                media_type="tv",
+                season=season,
+                episodes=[episode],
+            )
+            if ok:
+                accepted.add(episode)
+                if not duplicate:
+                    newly_queued.append(episode)
+                    history.append({
+                        "title": mediainfo.title,
+                        "year": mediainfo.year,
+                        "type": "电视剧",
+                        "status": "成功",
+                        "episode": episode,
+                        "share_ref": (
+                            "ed2k:"
+                            + self._ed2k_source_ref(
+                                str(resource.get("url") or "")
+                            )
+                        ),
+                        "file_name": str(resource.get("title") or "")[:500],
+                        "filter_score": pack.score,
+                        "perfect_match": True,
+                        "subscribe_id": subscribe_id,
+                        "generation": self._lifecycle.generation(subscribe_id),
+                        "media_key": media_key,
+                        "stage": "pending_transfer",
+                        "search_source": (
+                            "ayclub_ed2k_completed_season_wash"
+                        ),
+                        "time": datetime.datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    })
+            else:
+                failed.append(episode)
+
+        complete = set(expected).issubset(accepted)
+        status = "submitted" if complete else "partial"
+        retry_days = (
+            self.COMPLETED_ED2K_WASH_RECHECK_DAYS
+            if complete
+            else self.COMPLETED_ED2K_WASH_PARTIAL_RETRY_DAYS
+        )
+        self._record_completed_ed2k_wash(
+            tmdb_id=tmdb_id,
+            season=season,
+            status=status,
+            retry_days=retry_days,
+            fingerprint=pack.fingerprint,
+            signature_ref=pack.signature_ref,
+            score=pack.score,
+            expected_episodes=expected,
+            accepted_episodes=sorted(accepted),
+            failed_episodes=failed,
+            diagnostics={
+                "newly_queued": len(newly_queued),
+                "complete_group_count": diagnostics.get(
+                    "complete_group_count", 0
+                ),
+            },
+        )
+        if newly_queued:
+            transferred_count += len(newly_queued)
+            transfer_details.append({
+                "type": "电视剧",
+                "title": (
+                    f"{mediainfo.title} S{season} 完整整季ED2K洗版"
+                ),
+                "year": mediainfo.year,
+                "image": mediainfo.get_poster_image(),
+                "file_name": (
+                    f"E{expected[0]:02d}-E{expected[-1]:02d}，"
+                    f"新提交 {len(newly_queued)}/{len(expected)}"
+                ),
+            })
+
+        logger.info(
+            f"完整统一 ED2K 整季洗版批次处理完成："
+            f"{mediainfo.title_year} S{season}，"
+            f"pack={pack.signature_ref}，分数={pack.score}，"
+            f"已接受={len(accepted)}/{len(expected)}，"
+            f"本次新提交={len(newly_queued)}，失败={failed}；"
+            "现有媒体不会由本插件删除"
+        )
         return transferred_count
 
     def process_tv_subscribe(

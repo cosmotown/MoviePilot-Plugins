@@ -288,7 +288,21 @@ class LifecycleStore:
             }
             if subscribe_info is not None:
                 record["media_key"] = self.media_key_from_subscribe(subscribe_info)
-                record["name"] = self._value(subscribe_info, "name")
+                for field in (
+                    "name",
+                    "year",
+                    "type",
+                    "tmdbid",
+                    "doubanid",
+                    "season",
+                    "total_episode",
+                    "start_episode",
+                    "best_version",
+                    "quality",
+                    "resolution",
+                    "effect",
+                ):
+                    record[field] = self._value(subscribe_info, field)
             record.update({
                 "active": False,
                 "status": status,
@@ -380,6 +394,43 @@ class LifecycleStore:
                     f"订阅 {sid} 已不在 MoviePilot 活动列表，生命周期状态改为 inactive"
                 )
             self._save(state)
+
+
+    def completed_subscription_records(
+        self,
+        max_age_days: int = 30,
+    ) -> List[Dict[str, Any]]:
+        # 返回最近由 MoviePilot 正式完成事件确认的订阅快照。
+        cutoff = self._now() - datetime.timedelta(
+            days=max(1, int(max_age_days))
+        )
+        result: List[tuple[datetime.datetime, int, Dict[str, Any]]] = []
+        with self._lock:
+            state = self._load()
+            for record in (state.get("subscriptions") or {}).values():
+                if str(record.get("status") or "") != "completed":
+                    continue
+                completed_at = self._parse_time(record.get("completed_at"))
+                if not completed_at or completed_at < cutoff:
+                    continue
+                try:
+                    subscribe_id = int(record.get("subscribe_id"))
+                except (TypeError, ValueError):
+                    continue
+                normalized = dict(record)
+                normalized["subscribe_id"] = subscribe_id
+                result.append((completed_at, subscribe_id, normalized))
+        result.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [record for _, _, record in result]
+
+    def completed_subscription_ids(
+        self,
+        max_age_days: int = 30,
+    ) -> List[int]:
+        return [
+            int(record["subscribe_id"])
+            for record in self.completed_subscription_records(max_age_days)
+        ]
 
     @staticmethod
     def _task_id(
