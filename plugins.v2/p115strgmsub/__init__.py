@@ -52,7 +52,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.10"
+    plugin_version = "1.9.11"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -951,7 +951,7 @@ class P115StrgmSub(_PluginBase):
 
     @eventmanager.register(EventType.SubscribeModified)
     def on_subscribe_modified(self, event: Event):
-        """响应 MP 普通修改、状态变化、重置和 Agent 更新。"""
+        """响应 MP 普通修改和重置；status-only 仅记录，不触发即时同步。"""
         sid = self._get_subscribe_id_from_event(event)
         if not sid or self._is_subscribe_excluded(sid):
             return
@@ -959,6 +959,15 @@ class P115StrgmSub(_PluginBase):
         scene = str(data.get("scene") or "update") if isinstance(data, dict) else "update"
         fields = list(data.get("fields") or []) if isinstance(data, dict) else []
         subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
+        if scene.strip().casefold() == "status":
+            logger.info(
+                f"收到 MP 订阅状态写入：subscribe_id={sid}, "
+                f"scene={scene}, fields={fields}；"
+                "status-only 事件仅记录，不更新插件生命周期、"
+                "不安排即时同步、不调用任何搜索源或 AYCLUB Bridge；"
+                "下一次配置 Cron 统一按 MoviePilot 当前活动订阅对账"
+            )
+            return
         self._init_lifecycle_store()
         record = self._lifecycle_store.on_modified(
             sid,
