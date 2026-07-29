@@ -509,6 +509,15 @@ class LifecycleStore:
                     "share_ref": share_ref,
                     "target_path": target_path,
                     "source": source,
+                    "filter_score": item.get("score"),
+                    "perfect_match": bool(item.get("is_perfect")),
+                    "is_upgrade": bool(item.get("is_upgrade")),
+                    "best_version": bool(
+                        self._value(subscribe, "best_version")
+                    ),
+                    "best_version_full": bool(
+                        self._value(subscribe, "best_version_full")
+                    ),
                     "status": (
                         "pending_transfer"
                         if str(source or "") == "ayclub_ed2k"
@@ -648,6 +657,37 @@ class LifecycleStore:
                 # 状态迁移需要明确知道写入是否成功，因此这里不吞掉异常。
                 self._save_data(self.DATA_KEY, state)
         return invalidated
+
+
+    def best_version_terminal_episodes(self, subscribe_id: int) -> Set[int]:
+        "返回当前订阅周期已由 MP 整理且满足全部洗版条件的剧集。"
+        sid = str(int(subscribe_id))
+        with self._lock:
+            state = self._load()
+            record = (state.get("subscriptions") or {}).get(sid) or {}
+            generation = int(record.get("generation") or 1)
+            result: Set[int] = set()
+            for task in (state.get("pending") or {}).values():
+                try:
+                    task_subscribe_id = int(task.get("subscribe_id"))
+                    task_generation = int(task.get("generation"))
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    task_subscribe_id != int(subscribe_id)
+                    or task_generation != generation
+                    or not bool(task.get("best_version"))
+                    or not bool(task.get("perfect_match"))
+                    or task.get("status") not in {"organized", "verified_by_mp"}
+                ):
+                    continue
+                try:
+                    number = int(task.get("episode"))
+                except (TypeError, ValueError):
+                    continue
+                if number > 0:
+                    result.add(number)
+            return result
 
     def blocking_pending_tasks(self) -> List[Dict[str, Any]]:
         """返回仍可能造成 MoviePilot 原生订阅重复下载的活动在途任务。

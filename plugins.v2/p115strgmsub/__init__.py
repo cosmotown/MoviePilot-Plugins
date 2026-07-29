@@ -17,6 +17,7 @@ from sqlalchemy import text
 
 from app.core.config import settings, global_vars
 from app.core.event import Event, eventmanager
+from app.core.metainfo import MetaInfo
 from app.chain.subscribe import SubscribeChain
 from app.db import SessionFactory
 from app.db.subscribe_oper import SubscribeOper
@@ -52,7 +53,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.11"
+    plugin_version = "1.9.12"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -606,6 +607,37 @@ class P115StrgmSub(_PluginBase):
             f"初始延迟={delay}分钟"
         )
 
+
+    def _on_plugin_pending_created(
+        self,
+        *,
+        subscribe_id: int,
+        task_ids: List[str],
+        source: str,
+    ) -> None:
+        "PT 已开放后产生新在途任务时，立即恢复屏蔽并重建入库屏障。"
+        if not self._enabled or not task_ids:
+            return
+        if self._block_system_subscribe:
+            return
+        if not self._window_enabled():
+            logger.warning(
+                f"插件新增在途任务但 PT 窗口功能已禁用："
+                f"subscribe_id={subscribe_id}, source={source}"
+            )
+            return
+        logger.warning(
+            f"PT 窗口开放期间新增插件在途任务，立即恢复屏蔽："
+            f"subscribe_id={subscribe_id}, source={source}, tasks={len(task_ids)}"
+        )
+        self._enter_blocked(reason=f"插件新增在途任务 subscribe_id={subscribe_id}")
+        if not self._block_system_subscribe:
+            logger.error("新增在途任务后恢复 PT 屏蔽失败，不安排重新开放")
+            return
+        self._schedule_unblock_after_delay(
+            datetime.datetime.now(tz=pytz.timezone(settings.TZ))
+        )
+
     @staticmethod
     def _pt_gate_task_label(task: Dict[str, Any]) -> str:
         subscribe_id = task.get("subscribe_id")
@@ -1007,6 +1039,98 @@ class P115StrgmSub(_PluginBase):
         self._lifecycle_store.on_complete(sid, subscribe_info)
         logger.info(f"收到 MP 订阅完成：subscribe_id={sid}")
 
+
+    def _record_best_version_transfer_facts(
+        self,
+        matched: List[Dict[str, Any]],
+        mediainfo: Any,
+    ) -> None:
+        "MP 确认整理后，才把完美匹配的网盘洗版写入官方订阅质量事实。"
+        grouped: Dict[int, Set[int]] = {}
+        for task in matched or []:
+            if (
+                not bool(task.get("best_version"))
+                or not bool(task.get("perfect_match"))
+                or task.get("episode") is None
+            ):
+                continue
+            try:
+                sid = int(task.get("subscribe_id"))
+                episode = int(task.get("episode"))
+            except (TypeError, ValueError):
+                continue
+            if sid > 0 and episode > 0:
+                grouped.setdefault(sid, set()).add(episode)
+        if not grouped:
+            return
+        self._init_lifecycle_store()
+        for sid, episodes in grouped.items():
+            try:
+                with SessionFactory() as db:
+                    subscribe_oper = SubscribeOper(db=db)
+                    subscribe = subscribe_oper.get(sid)
+                    if (
+                        not subscribe
+                        or not bool(getattr(subscribe, "best_version", False))
+                        or getattr(subscribe, "type", None) != MediaType.TV.value
+                    ):
+                        continue
+                    chain = SubscribeChain()
+                    if not hasattr(chain, "backfill_existing_episodes"):
+                        logger.warning(
+                            f"MoviePilot 当前版本缺少 backfill_existing_episodes，"
+                            f"无法写入洗版终态：subscribe_id={sid}"
+                        )
+                        continue
+                    summary = chain.backfill_existing_episodes(
+                        subscribe=subscribe,
+                        episodes=sorted(episodes),
+                        priority=100,
+                        scene="p115strgmsub_best_version_transfer",
+                    )
+                    start_episode = max(1, int(getattr(subscribe, "start_episode", 1) or 1))
+                    total_episode = int(getattr(subscribe, "total_episode", 0) or 0)
+                    expected = set(range(start_episode, total_episode + 1)) if total_episode >= start_episode else set()
+                    terminal = self._lifecycle_store.best_version_terminal_episodes(sid)
+                    if (
+                        bool(getattr(subscribe, "best_version_full", False))
+                        and expected
+                        and expected.issubset(terminal)
+                    ):
+                        subscribe_oper.update(sid, {"current_priority": 100})
+                        subscribe.current_priority = 100
+                        logger.info(
+                            f"全集洗版已由 MP 整理确认完整覆盖，"
+                            f"写入 current_priority=100：subscribe_id={sid}"
+                        )
+                    meta = MetaInfo(subscribe.name)
+                    meta.year = subscribe.year
+                    meta.type = MediaType.TV
+                    meta.begin_season = subscribe.season or 1
+                    mediakey = (
+                        getattr(mediainfo, "tmdb_id", None)
+                        or getattr(mediainfo, "douban_id", None)
+                        or getattr(subscribe, "tmdbid", None)
+                        or getattr(subscribe, "doubanid", None)
+                    )
+                    exist_flag, _ = chain.check_and_handle_existing_media(
+                        subscribe=subscribe,
+                        meta=meta,
+                        mediainfo=mediainfo,
+                        mediakey=mediakey,
+                    )
+                    logger.info(
+                        f"已回填网盘洗版质量事实：subscribe_id={sid}，"
+                        f"episodes={sorted(episodes)}，"
+                        f"updated={bool(summary.get('updated'))}，"
+                        f"terminal={sorted(terminal)}，completed={bool(exist_flag)}"
+                    )
+            except Exception as error:
+                logger.warning(
+                    f"回填 MoviePilot 洗版质量事实失败："
+                    f"subscribe_id={sid}，错误={error}"
+                )
+
     def _handle_transfer_event(self, event: Event, success: bool):
         data = event.event_data or {}
         if not isinstance(data, dict):
@@ -1035,6 +1159,8 @@ class P115StrgmSub(_PluginBase):
             logger.info(
                 f"已被动更新在途状态，不接管后续整理链路：media_key={media_key}"
             )
+            if success:
+                self._record_best_version_transfer_facts(matched, mediainfo)
 
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event):
@@ -1481,7 +1607,8 @@ class P115StrgmSub(_PluginBase):
             post_message_func=self.post_message,
             get_data_func=self.get_data,
             save_data_func=self.save_data,
-            lifecycle_store=self._lifecycle_store
+            lifecycle_store=self._lifecycle_store,
+            on_pending_created_func=self._on_plugin_pending_created,
         )
 
         self._api_handler = ApiHandler(

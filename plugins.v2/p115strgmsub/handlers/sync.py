@@ -63,7 +63,8 @@ class SyncHandler:
         post_message_func: Callable = None,
         get_data_func: Callable = None,
         save_data_func: Callable = None,
-        lifecycle_store: Optional[LifecycleStore] = None
+        lifecycle_store: Optional[LifecycleStore] = None,
+        on_pending_created_func: Callable = None,
     ):
         """
         初始化同步处理器
@@ -101,6 +102,7 @@ class SyncHandler:
             get_data_func=get_data_func,
             save_data_func=save_data_func,
         )
+        self._on_pending_created = on_pending_created_func
         self._release_gate = ReleaseGateStore(
             get_data_func=get_data_func,
             save_data_func=save_data_func,
@@ -108,6 +110,30 @@ class SyncHandler:
         self._migrate_ed2k_state_v189()
         self._migrate_ed2k_episode_state_v190()
         self._migrate_ed2k_contract_state_v192()
+
+
+    def _notify_pending_created(
+        self,
+        *,
+        subscribe: Any,
+        task_ids: List[str],
+        source: str,
+    ) -> None:
+        "通知插件：已产生新的真实在途任务，必要时重新关闭 PT 窗口。"
+        if not task_ids or not self._on_pending_created:
+            return
+        try:
+            self._on_pending_created(
+                subscribe_id=int(getattr(subscribe, "id")),
+                task_ids=list(task_ids),
+                source=str(source or "unknown"),
+            )
+        except Exception as error:
+            logger.warning(
+                f"通知 PT 窗口重新屏蔽失败："
+                f"subscribe_id={getattr(subscribe, 'id', '?')}，"
+                f"source={source or 'unknown'}，错误={error}"
+            )
 
     def _migrate_ed2k_state_v189(self) -> None:
         """清理 1.8.8 可能由模糊 HTTP 2xx 产生的伪在途状态。"""
@@ -286,6 +312,26 @@ class SyncHandler:
                 continue
             if number > 0 and number not in result:
                 result.append(number)
+        return sorted(result)
+
+
+    @staticmethod
+    def _select_tv_delivery_episodes(
+        *,
+        is_best_version: bool,
+        mp_target_episodes: List[int],
+        local_missing_episodes: List[int],
+    ) -> List[int]:
+        "普通追更使用本地缺集；洗版必须保留 MoviePilot 的质量目标。"
+        selected = mp_target_episodes if is_best_version else local_missing_episodes
+        result: List[int] = []
+        for value in selected or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0 and episode not in result:
+                result.append(episode)
         return sorted(result)
 
     @staticmethod
@@ -722,6 +768,8 @@ class SyncHandler:
         resource_title: str,
         episodes: Optional[List[int]],
         attempt_id: str,
+        filter_score: Optional[int] = None,
+        perfect_match: bool = False,
     ) -> None:
         normalized_episodes = []
         for value in episodes or []:
@@ -739,6 +787,8 @@ class SyncHandler:
                     "episode": episode,
                     "id": f"ed2k:{source_ref}:{attempt_id}:{episode}",
                     "name": resource_title,
+                    "score": filter_score,
+                    "is_perfect": bool(perfect_match),
                 }
                 for episode in normalized_episodes
             ]
@@ -748,13 +798,18 @@ class SyncHandler:
                 "name": resource_title,
             }]
 
-        self._lifecycle.add_pending(
+        task_ids = self._lifecycle.add_pending(
             subscribe=subscribe,
             media_key=media_key,
             episodes=normalized_episodes or None,
             file_items=file_items,
             share_ref=f"ed2k:{source_ref}",
             target_path="/OpenClaw_ED2K下载中",
+            source="ayclub_ed2k",
+        )
+        self._notify_pending_created(
+            subscribe=subscribe,
+            task_ids=task_ids,
             source="ayclub_ed2k",
         )
 
@@ -768,6 +823,8 @@ class SyncHandler:
         media_type: str,
         season: Optional[int] = None,
         episodes: Optional[List[int]] = None,
+        filter_score: Optional[int] = None,
+        perfect_match: bool = False,
     ) -> tuple[bool, bool]:
         """提交 ED2K；返回 (已接受或去重命中, 是否去重命中)。"""
         source_url = str(resource.get("url") or "").strip()
@@ -855,6 +912,8 @@ class SyncHandler:
             resource_title=resource_title,
             episodes=episodes,
             attempt_id=attempt_id,
+            filter_score=filter_score,
+            perfect_match=perfect_match,
         )
         logger.info(
             f"ED2K 已交给 OpenClaw/p115 后端：ref={source_ref}，"
@@ -1675,16 +1734,23 @@ class SyncHandler:
 
                             # 转存成功只表示已经投递到 MP 整理入口。
                             # 不写 MoviePilot 下载事实，不直接修改订阅进度或强制完成。
-                            self._lifecycle.add_pending(
+                            task_ids = self._lifecycle.add_pending(
                                 subscribe=subscribe,
                                 media_key=media_key,
                                 episodes=None,
                                 file_items=[{
                                     "id": matched_file.get("id"),
                                     "name": file_name,
+                                    "score": current_score,
+                                    "is_perfect": is_perfect,
                                 }],
                                 share_ref=share_ref,
                                 target_path=save_dir,
+                                source=str(resource.get("search_source") or resource.get("source") or ""),
+                            )
+                            self._notify_pending_created(
+                                subscribe=subscribe,
+                                task_ids=task_ids,
                                 source=str(resource.get("search_source") or resource.get("source") or ""),
                             )
                             logger.info(
@@ -2284,6 +2350,7 @@ class SyncHandler:
         try:
             logger.info(f"订阅信息：{subscribe.name}，开始集数：{subscribe.start_episode}, 总集数：{subscribe.total_episode}, 缺失集数：{subscribe.lack_episode}")
             logger.info(f"处理订阅：{subscribe.name} (S{subscribe.season or 1})")
+            is_best_version = bool(subscribe.best_version)
 
             # 加载该订阅的历史积分花费（用 tmdb_id + 季数作为唯一标识）
             sub_key = f"tmdb_{subscribe.tmdbid}_S{subscribe.season or 1}" if subscribe.tmdbid else f"{subscribe.name}_S{subscribe.season or 1}"
@@ -2356,6 +2423,7 @@ class SyncHandler:
                 ]
 
             mp_missing_episodes = list(missing_episodes)
+            local_missing_episodes = list(mp_missing_episodes)
 
             # 本地 STRM 是本环境的可播放事实源。MoviePilot 的下载历史和
             # Emby 扫描可能滞后，因此在搜索前用当前 STRM 文件重建缺集。
@@ -2378,8 +2446,12 @@ class SyncHandler:
                             f"MP={sorted(mp_missing_episodes)}，"
                             f"STRM={local_missing}，已存在STRM={sorted(strm_episodes)}"
                         )
-                    missing_episodes = local_missing
-                    mp_missing_episodes = list(local_missing)
+                    local_missing_episodes = list(local_missing)
+                    if is_best_version:
+                        logger.info(
+                            f"{mediainfo.title_year} S{season} 为洗版订阅，"
+                            "本地 STRM 仅证明当前版本可播放，不覆盖 MoviePilot 质量目标"
+                        )
                     logger.info(
                         f"{mediainfo.title_year} S{season} STRM 对账目录："
                         f"{strm_dirs[:3]}"
@@ -2401,6 +2473,17 @@ class SyncHandler:
                             "本轮停止该订阅"
                         )
                         return transferred_count
+
+            missing_episodes = self._select_tv_delivery_episodes(
+                is_best_version=is_best_version,
+                mp_target_episodes=mp_missing_episodes,
+                local_missing_episodes=local_missing_episodes,
+            )
+            if is_best_version:
+                logger.info(
+                    f"{mediainfo.title_year} S{season} 洗版目标剧集："
+                    f"{missing_episodes}；本地缺集={local_missing_episodes}"
+                )
 
             # MP 事件是主路径；插件只用在途任务避免整理期间重复投递。
             pending_episodes = self._lifecycle.pending_episodes(media_key)
@@ -2444,7 +2527,6 @@ class SyncHandler:
                         self._search_handler.clear_sub_points(sub_key)
                 return transferred_count
 
-            is_best_version = bool(subscribe.best_version)
             episode_history_scores: Dict[int, int] = {}
             if is_best_version:
                 for item in self._current_cycle_history(history, subscribe, media_key):
@@ -2818,6 +2900,23 @@ class SyncHandler:
                     ]
 
                     for resource in ayclub_ed2k_results:
+                        ed2k_title = str(resource.get("title") or "")
+                        if subscribe_filter.has_filters():
+                            ed2k_matched, ed2k_score = subscribe_filter.match(ed2k_title)
+                            ed2k_perfect = subscribe_filter.is_perfect_match(ed2k_title)
+                        else:
+                            ed2k_matched, ed2k_score = True, 0
+                            ed2k_perfect = not is_best_version
+                        if not ed2k_matched:
+                            logger.info("跳过不符合订阅条件的电视剧 ED2K 候选")
+                            continue
+                        if (
+                            is_best_version
+                            and subscribe_filter.has_filters()
+                            and not ed2k_perfect
+                        ):
+                            logger.info("洗版 ED2K 候选未满足全部配置条件，跳过自动投递")
+                            continue
                         candidate_episodes, reject_reason = (
                             self._select_tv_ed2k_candidate_episodes(
                                 resource=resource,
@@ -2840,6 +2939,8 @@ class SyncHandler:
                             media_type="tv",
                             season=int(season),
                             episodes=candidate_episodes,
+                            filter_score=ed2k_score,
+                            perfect_match=ed2k_perfect,
                         )
                         if accepted:
                             ed2k_dispatched_this_source.update(candidate_episodes)
@@ -3004,7 +3105,21 @@ class SyncHandler:
                                 logger.info(f"找到匹配文件：{file_name} -> E{episode:02d}")
 
                                 _, current_score = subscribe_filter.match(file_name) if subscribe_filter.has_filters() else (True, 0)
-                                is_perfect = subscribe_filter.is_perfect_match(file_name) if subscribe_filter.has_filters() else True
+                                is_perfect = (
+                                    subscribe_filter.is_perfect_match(file_name)
+                                    if subscribe_filter.has_filters()
+                                    else not is_best_version
+                                )
+                                if (
+                                    is_best_version
+                                    and subscribe_filter.has_filters()
+                                    and not is_perfect
+                                ):
+                                    logger.info(
+                                        f"E{episode:02d} 洗版候选未满足全部配置条件，"
+                                        "跳过自动投递，保留 MoviePilot 后续 PT 兜底"
+                                    )
+                                    continue
 
                                 is_upgrade = False
                                 if is_best_version and episode in episode_history_scores:
@@ -3179,13 +3294,18 @@ class SyncHandler:
                                 item for item in matched_items
                                 if item["file"]["id"] in success_id_set
                             ]
-                            self._lifecycle.add_pending(
+                            task_ids = self._lifecycle.add_pending(
                                 subscribe=subscribe,
                                 media_key=media_key,
                                 episodes=batch_success_episodes,
                                 file_items=success_items,
                                 share_ref=share_ref,
                                 target_path=save_dir,
+                                source=str(resource.get("search_source") or resource.get("source") or source),
+                            )
+                            self._notify_pending_created(
+                                subscribe=subscribe,
+                                task_ids=task_ids,
                                 source=str(resource.get("search_source") or resource.get("source") or source),
                             )
                             logger.info(

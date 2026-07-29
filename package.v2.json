@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合 MoviePilot 正式缺失状态，自动处理 115 分享及 AYCLUB ED2K 资源。",
     "labels": "订阅,115网盘,STRM",
-    "version": "1.9.11",
+    "version": "1.9.12",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.9.12": "修复活动洗版订阅被本地 STRM 完整状态提前短路及 PT 窗口重复下载：普通追更继续以本地实际缺集决定投递，洗版订阅改用 MoviePilot 质量目标，不再用 STRM 结果覆盖 MP 缺失/洗版事实；洗版候选仅接受满足全部配置条件的资源，MoviePilot TransferComplete 后按官方订阅接口回填终态质量并完成洗版；PT 已开放后若插件新增 115/ED2K 在途任务，立即重新屏蔽 PT 并重新进入入库屏障。",
       "v1.9.11": "修复 MoviePilot 订阅 status-only 事件造成的无效定向同步：EVH 等外部服务重复 PUT 相同订阅状态时，插件仅记录事件，不更新插件生命周期、不安排即时同步、不调用任何搜索源或 AYCLUB Bridge；普通字段修改、reset、新增/重新订阅、Cron、手动/API 以及 1.9.10 既有查询来源门禁全部保持不变。",
       "v1.9.10": "修复 AYCLUB 触发来源越权：彻底移除旧22:00-24:00固定真实搜索窗口，新增 query_origin 来源门禁；只有 Cron 当天最后一轮、生命周期强刷及明确手动/API全量任务可获得真实搜索权限，订阅status等定向同步严格只读缓存；手动全量仍受同媒体每日去重，电影门禁同步修复，Bridge 1.5.3不变。",
       "v1.9.9": "新增已完成电视剧完整统一 ED2K 整季洗版：仅 Cron 当天最后一轮检查最近30天由 MoviePilot 正式完成且开启洗版的订阅；真实文件名季集覆盖必须完整、连续、无重复且命名指纹一致，才按单集批量提交 OpenClaw/p115；加入整包指纹、质量分与部分失败持久化去重，容量不足不启动批次，不删除现有媒体，Bridge 1.5.3 协议保持不变。",
