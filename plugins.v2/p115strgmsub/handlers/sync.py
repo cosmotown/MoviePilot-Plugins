@@ -65,6 +65,7 @@ class SyncHandler:
         save_data_func: Callable = None,
         lifecycle_store: Optional[LifecycleStore] = None,
         on_pending_created_func: Callable = None,
+        nextfind_manager=None,
     ):
         """
         初始化同步处理器
@@ -103,6 +104,7 @@ class SyncHandler:
             save_data_func=save_data_func,
         )
         self._on_pending_created = on_pending_created_func
+        self._nextfind = nextfind_manager
         self._release_gate = ReleaseGateStore(
             get_data_func=get_data_func,
             save_data_func=save_data_func,
@@ -1441,6 +1443,23 @@ class SyncHandler:
                     )
                 except Exception as error:
                     logger.warning(f"交由 MP 完成电影订阅失败，将由后续对账恢复：{error}")
+                if self._nextfind:
+                    self._nextfind.mark_media_satisfied(
+                        subscribe=subscribe,
+                        tmdb_id=(mediainfo.tmdb_id or subscribe.tmdbid),
+                        media_type="movie",
+                    )
+                return transferred_count
+
+            if (
+                self._nextfind
+                and self._nextfind.gate_before_search(
+                    subscribe=subscribe,
+                    tmdb_id=(mediainfo.tmdb_id or subscribe.tmdbid),
+                    media_type="movie",
+                    title=mediainfo.title,
+                )
+            ):
                 return transferred_count
 
             if self._lifecycle.has_pending_movie(media_key):
@@ -1839,6 +1858,24 @@ class SyncHandler:
                     f"no_result_cooldown_until={result_state.get('no_result_cooldown_until')}，"
                     f"跳过原因={result_state.get('last_skip_reason')}"
                 )
+
+            ayclub_real_terminal = bool(
+                ayclub_query_status in {"ok_empty", "ok_matched", "invalid_result"}
+                and (force_honored or ayclub_cached is False or ayclub_late_reply)
+            )
+            if (
+                self._nextfind
+                and mediainfo.tmdb_id
+                and not movie_transferred
+                and ayclub_real_terminal
+            ):
+                if self._nextfind.handoff_after_ayclub(
+                    subscribe=subscribe,
+                    tmdb_id=mediainfo.tmdb_id,
+                    media_type="movie",
+                    title=mediainfo.title,
+                ):
+                    movie_transferred = True
 
             if not resource_found:
                 logger.info(
@@ -2351,6 +2388,7 @@ class SyncHandler:
             logger.info(f"订阅信息：{subscribe.name}，开始集数：{subscribe.start_episode}, 总集数：{subscribe.total_episode}, 缺失集数：{subscribe.lack_episode}")
             logger.info(f"处理订阅：{subscribe.name} (S{subscribe.season or 1})")
             is_best_version = bool(subscribe.best_version)
+            transferred_count_at_start = transferred_count
 
             # 加载该订阅的历史积分花费（用 tmdb_id + 季数作为唯一标识）
             sub_key = f"tmdb_{subscribe.tmdbid}_S{subscribe.season or 1}" if subscribe.tmdbid else f"{subscribe.name}_S{subscribe.season or 1}"
@@ -2485,6 +2523,19 @@ class SyncHandler:
                     f"{missing_episodes}；本地缺集={local_missing_episodes}"
                 )
 
+            if (
+                self._nextfind
+                and self._nextfind.gate_before_search(
+                    subscribe=subscribe,
+                    tmdb_id=(mediainfo.tmdb_id or subscribe.tmdbid),
+                    media_type="tv",
+                    title=mediainfo.title,
+                    season=season,
+                    episodes=missing_episodes,
+                )
+            ):
+                return transferred_count
+
             # MP 事件是主路径；插件只用在途任务避免整理期间重复投递。
             pending_episodes = self._lifecycle.pending_episodes(media_key)
             if pending_episodes:
@@ -2525,6 +2576,12 @@ class SyncHandler:
                         )
                     if hasattr(self._search_handler, "clear_sub_points"):
                         self._search_handler.clear_sub_points(sub_key)
+                    if self._nextfind:
+                        self._nextfind.mark_media_satisfied(
+                            subscribe=subscribe,
+                            tmdb_id=(mediainfo.tmdb_id or subscribe.tmdbid),
+                            media_type="tv",
+                        )
                 return transferred_count
 
             episode_history_scores: Dict[int, int] = {}
@@ -2699,6 +2756,7 @@ class SyncHandler:
             # 成功转存的集数列表
             success_episodes = []
             ed2k_dispatched_episodes: Set[int] = set()
+            ayclub_real_query_performed = False
 
             # 同一部剧同一季度只需成功分类一次；
             # 后续分享复用分类目录。
@@ -2822,6 +2880,7 @@ class SyncHandler:
                         reason=ayclub_query_reason,
                     )
                     if real_query:
+                        ayclub_real_query_performed = True
                         logger.info(
                             f"{mediainfo.title_year} S{season} AYCLUB 今日真实搜索已记录"
                         )
@@ -3330,6 +3389,28 @@ class SyncHandler:
                         logger.info(f"[{source.upper()}] 处理完成，仍有 {len(missing_episodes)} 集缺失，继续查询下一个源: {remaining_sources[0].upper()}")
                     else:
                         logger.info(f"[{source.upper()}] 处理完成，仍有 {len(missing_episodes)} 集缺失，已无更多可用源")
+
+            remaining_for_nextfind = sorted(
+                set(missing_episodes) - set(ed2k_dispatched_episodes)
+            )
+            ayclub_status = self._search_handler.get_ayclub_last_status()
+            if (
+                self._nextfind
+                and mediainfo.tmdb_id
+                and remaining_for_nextfind
+                and ayclub_real_query_performed
+                and ayclub_status in {"ok_empty", "ok_matched", "invalid_result"}
+                and transferred_count == transferred_count_at_start
+                and not ed2k_dispatched_episodes
+            ):
+                self._nextfind.handoff_after_ayclub(
+                    subscribe=subscribe,
+                    tmdb_id=mediainfo.tmdb_id,
+                    media_type="tv",
+                    title=mediainfo.title,
+                    season=season,
+                    episodes=remaining_for_nextfind,
+                )
 
             # 不直接写 note/lack_episode，也不强制完成订阅。
             # MP 的 TransferComplete、订阅刷新与 SubscribeComplete 负责最终状态。

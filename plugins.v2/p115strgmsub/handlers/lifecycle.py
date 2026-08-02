@@ -23,6 +23,7 @@ class LifecycleStore:
     SCHEMA_VERSION = 2
     PENDING_TTL_HOURS = 12
     ED2K_PENDING_TTL_HOURS = 24
+    NEXTFIND_PENDING_TTL_HOURS = 48
 
     def __init__(
         self,
@@ -520,7 +521,7 @@ class LifecycleStore:
                     ),
                     "status": (
                         "pending_transfer"
-                        if str(source or "") == "ayclub_ed2k"
+                        if str(source or "") in {"ayclub_ed2k", "nextfind"}
                         else "pending_organize"
                     ),
                     "created_at": old.get("created_at") or self._now_text(),
@@ -540,11 +541,13 @@ class LifecycleStore:
         for task in state["pending"].values():
             if task.get("media_key") != media_key or not self._is_live_pending(task):
                 continue
-            ttl_hours = (
-                self.ED2K_PENDING_TTL_HOURS
-                if str(task.get("source") or "") == "ayclub_ed2k"
-                else self.PENDING_TTL_HOURS
-            )
+            source = str(task.get("source") or "")
+            if source == "ayclub_ed2k":
+                ttl_hours = self.ED2K_PENDING_TTL_HOURS
+            elif source == "nextfind":
+                ttl_hours = self.NEXTFIND_PENDING_TTL_HOURS
+            else:
+                ttl_hours = self.PENDING_TTL_HOURS
             deadline = now - datetime.timedelta(hours=ttl_hours)
             created = self._parse_time(task.get("created_at"))
             if created and created < deadline:
@@ -656,6 +659,37 @@ class LifecycleStore:
                 state["schema_version"] = self.SCHEMA_VERSION
                 # 状态迁移需要明确知道写入是否成功，因此这里不吞掉异常。
                 self._save_data(self.DATA_KEY, state)
+        return invalidated
+
+
+    def invalidate_pending_for_media(
+        self,
+        *,
+        media_key: str,
+        source: str,
+        reason: str,
+    ) -> List[Dict[str, Any]]:
+        """Invalidate one source only for one MoviePilot media key."""
+        invalidated: List[Dict[str, Any]] = []
+        normalized_source = str(source or "").strip()
+        if not media_key or not normalized_source:
+            return invalidated
+        with self._lock:
+            state = self._load()
+            for task in state["pending"].values():
+                if (
+                    task.get("media_key") != media_key
+                    or str(task.get("source") or "") != normalized_source
+                    or not self._is_live_pending(task)
+                ):
+                    continue
+                task["status"] = "invalidated"
+                task["invalidated_at"] = self._now_text()
+                task["failure_reason"] = str(reason or "远端状态已失效")
+                task["updated_at"] = self._now_text()
+                invalidated.append(dict(task))
+            if invalidated:
+                self._save(state)
         return invalidated
 
 

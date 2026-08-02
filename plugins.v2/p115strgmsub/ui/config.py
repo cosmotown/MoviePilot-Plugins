@@ -354,6 +354,97 @@ class UIConfig:
                             }
                         ]
                     },                    
+                    # NextFind 备用执行器
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12},
+                            'content': [{
+                                'component': 'VAlert',
+                                'props': {
+                                    'type': 'info',
+                                    'variant': 'tonal',
+                                    'text': 'NextFind 仅在 AYCLUB 已完成真实搜索且没有有效投递后接管。同一 TMDB 在 NextFind 活跃期间暂停 AYCLUB；最终仍以 MoviePilot 缺失状态为准。NextFind 内的“洗版覆盖”请保持关闭，避免追更时重复覆盖旧集。'
+                                }
+                            }]
+                        }]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 2},
+                                'content': [{
+                                    'component': 'VSwitch',
+                                    'props': {
+                                        'model': 'nextfind_enabled',
+                                        'label': '启用 NextFind 备用'
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'nextfind_url',
+                                        'label': 'NextFind OpenAPI 地址',
+                                        'placeholder': 'http://HOST_IP:8092/api/openapi',
+                                        'hint': '地址和密钥只保存在 MoviePilot 本地配置，不会写入 GitHub',
+                                        'persistent-hint': True
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'nextfind_api_key',
+                                        'label': 'NextFind OpenAPI Key',
+                                        'type': 'password',
+                                        'placeholder': 'X-API-Key',
+                                        'clearable': True
+                                    }
+                                }]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 6, 'md': 2},
+                                'content': [{
+                                    'component': 'VTextField',
+                                    'props': {
+                                        'model': 'nextfind_timeout',
+                                        'label': '接口超时（秒）',
+                                        'type': 'number',
+                                        'placeholder': '30'
+                                    }
+                                }]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [{
+                            'component': 'VCol',
+                            'props': {'cols': 12, 'md': 3},
+                            'content': [{
+                                'component': 'VTextField',
+                                'props': {
+                                    'model': 'nextfind_wait_hours',
+                                    'label': '接管保护上限（小时）',
+                                    'type': 'number',
+                                    'placeholder': '48',
+                                    'hint': '远端暂时不可核验时先防重复；超过上限才恢复 AYCLUB，范围6至168小时',
+                                    'persistent-hint': True
+                                }
+                            }]
+                        }]
+                    },
                     # PanSou说明
                     {
                         'component': 'VRow',
@@ -582,6 +673,13 @@ class UIConfig:
             "ayclub_url": "http://127.0.0.1:11592",
             "ayclub_timeout": 120,
             "ayclub_max_pages": 5,
+
+            # NextFind OpenAPI（真实值只在本地填写）
+            "nextfind_enabled": False,
+            "nextfind_url": "",
+            "nextfind_api_key": "",
+            "nextfind_timeout": 30,
+            "nextfind_wait_hours": 48,
 
             "nullbr_enabled": False,
             "nullbr_appid": "",

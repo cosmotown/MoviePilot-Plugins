@@ -7,11 +7,13 @@ from .sync_safe import SyncHandler
 from .subscribe import SubscribeHandler
 from .api import ApiHandler
 from .lifecycle import LifecycleStore
+from .nextfind import NextFindHandoffManager
 
 __all__ = [
     "SearchHandler",
     "SyncHandler",
     "SubscribeHandler",
     "ApiHandler",
-    "LifecycleStore"
+    "LifecycleStore",
+    "NextFindHandoffManager"
 ]

@@ -9,6 +9,7 @@ from .nullbr import NullbrClient
 from .hdhive import HDHiveOpenAPIClient, HDHiveOpenAPIError
 from .openclaw_classifier import OpenClawClassifierClient
 from .ayclub import AyclubClient
+from .nextfind import NextFindClient
 
 
 __all__ = [
@@ -19,4 +20,5 @@ __all__ = [
     "HDHiveOpenAPIError",
     "OpenClawClassifierClient",
     "AyclubClient",
+    "NextFindClient",
 ]

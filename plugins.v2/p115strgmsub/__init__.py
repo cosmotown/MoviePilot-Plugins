@@ -35,8 +35,16 @@ from .clients import (
     HDHiveOpenAPIError,
     OpenClawClassifierClient,
     AyclubClient,
+    NextFindClient,
 )
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, ApiHandler, LifecycleStore
+from .handlers import (
+    SearchHandler,
+    SyncHandler,
+    SubscribeHandler,
+    ApiHandler,
+    LifecycleStore,
+    NextFindHandoffManager,
+)
 from .ui import UIConfig
 from .utils import download_so_file
 
@@ -53,7 +61,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.12"
+    plugin_version = "1.9.13"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -85,6 +93,12 @@ class P115StrgmSub(_PluginBase):
     _ayclub_url: str = "http://127.0.0.1:11592"
     _ayclub_timeout: int = 120
     _ayclub_max_pages: int = 5
+    # NextFind 仅作为 AYCLUB 真实搜索无有效投递后的备用执行器
+    _nextfind_enabled: bool = False
+    _nextfind_url: str = ""
+    _nextfind_api_key: str = ""
+    _nextfind_timeout: int = 30
+    _nextfind_wait_hours: int = 48
 
     _save_path: str = "/我的接收/MoviePilot/TV"
     _movie_save_path: str = "/我的接收/MoviePilot/Movie"
@@ -145,6 +159,7 @@ class P115StrgmSub(_PluginBase):
     _nullbr_client: Optional[NullbrClient] = None
     _hdhive_client: Optional[Any] = None
     _ayclub_client: Optional[AyclubClient] = None
+    _nextfind_client: Optional[NextFindClient] = None
     _classifier_client: Optional[OpenClawClassifierClient] = None
     
     # 处理器
@@ -153,6 +168,7 @@ class P115StrgmSub(_PluginBase):
     _sync_handler: Optional[SyncHandler] = None
     _api_handler: Optional[ApiHandler] = None
     _lifecycle_store: Optional[LifecycleStore] = None
+    _nextfind_manager: Optional[NextFindHandoffManager] = None
 
     _MIN_INTERVAL_HOURS: int = 8
     _PT_GATE_RECHECK_SECONDS: int = 300
@@ -1013,6 +1029,11 @@ class P115StrgmSub(_PluginBase):
         )
         if scene == "reset":
             self._invalidate_subscribe_caches(subscribe_info)
+            if self._nextfind_manager:
+                self._nextfind_manager.release_subscribe_id(
+                    sid,
+                    reason="MoviePilot 订阅重置",
+                )
         self._schedule_lifecycle_sync(f"订阅修改 {sid}/{scene}", subscribe_ids=[sid])
 
     @eventmanager.register(EventType.SubscribeDeleted)
@@ -1025,6 +1046,11 @@ class P115StrgmSub(_PluginBase):
         subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
         self._init_lifecycle_store()
         self._lifecycle_store.on_deleted(sid, subscribe_info)
+        if self._nextfind_manager:
+            self._nextfind_manager.release_subscribe_id(
+                sid,
+                reason="MoviePilot 订阅取消/删除",
+            )
         logger.info(f"收到 MP 订阅取消/删除：subscribe_id={sid}")
 
     @eventmanager.register(EventType.SubscribeComplete)
@@ -1037,6 +1063,11 @@ class P115StrgmSub(_PluginBase):
         subscribe_info = data.get("subscribe_info") if isinstance(data, dict) else None
         self._init_lifecycle_store()
         self._lifecycle_store.on_complete(sid, subscribe_info)
+        if self._nextfind_manager:
+            self._nextfind_manager.release_subscribe_id(
+                sid,
+                reason="MoviePilot 订阅正式完成",
+            )
         logger.info(f"收到 MP 订阅完成：subscribe_id={sid}")
 
 
@@ -1186,6 +1217,8 @@ class P115StrgmSub(_PluginBase):
         # 只停止本插件服务，不触碰 MoviePilot 本体、订阅或媒体库数据。
         self.stop_service()
         self._lifecycle_store = None
+        self._nextfind_manager = None
+        self._nextfind_client = None
 
     # ------------------ init_plugin ------------------
 
@@ -1250,6 +1283,37 @@ class P115StrgmSub(_PluginBase):
                     1,
                 ),
                 10,
+            )
+            self._nextfind_enabled = bool(
+                config.get("nextfind_enabled", False)
+            )
+            self._nextfind_url = (
+                config.get("nextfind_url", "") or ""
+            ).strip()
+            self._nextfind_api_key = (
+                config.get("nextfind_api_key", "") or ""
+            ).strip()
+            self._nextfind_timeout = min(
+                max(
+                    self._safe_int(
+                        config.get("nextfind_timeout", 30),
+                        30,
+                        "nextfind_timeout",
+                    ),
+                    5,
+                ),
+                180,
+            )
+            self._nextfind_wait_hours = min(
+                max(
+                    self._safe_int(
+                        config.get("nextfind_wait_hours", 48),
+                        48,
+                        "nextfind_wait_hours",
+                    ),
+                    6,
+                ),
+                168,
             )
             self._save_path = config.get("save_path", "/我的接收/MoviePilot/TV")
             self._movie_save_path = config.get("movie_save_path", "/我的接收/MoviePilot/Movie")
@@ -1474,6 +1538,20 @@ class P115StrgmSub(_PluginBase):
                     f"{self._ayclub_url}"
                 )
             
+        self._nextfind_client = NextFindClient(
+            base_url=self._nextfind_url,
+            api_key=self._nextfind_api_key,
+            enabled=self._nextfind_enabled,
+            timeout=self._nextfind_timeout,
+        )
+        if self._nextfind_enabled:
+            if self._nextfind_client.is_ready:
+                logger.info("NextFind 备用执行器已配置，实际连通性将在任务前核验")
+            else:
+                logger.warning(
+                    "NextFind 已启用，但 OpenAPI 地址或 API Key 未配置完整"
+                )
+
         # OpenClaw 七分类客户端
         self._classifier_client = OpenClawClassifierClient(
             base_url=self._classifier_url,
@@ -1569,6 +1647,15 @@ class P115StrgmSub(_PluginBase):
         self._init_subscribe_handler()
         self._init_lifecycle_store()
 
+        self._nextfind_manager = NextFindHandoffManager(
+            client=self._nextfind_client,
+            lifecycle_store=self._lifecycle_store,
+            get_data_func=self.get_data,
+            save_data_func=self.save_data,
+            wait_hours=self._nextfind_wait_hours,
+            on_pending_created_func=self._on_plugin_pending_created,
+        )
+
         self._search_handler = SearchHandler(
             pansou_client=self._pansou_client,
             nullbr_client=self._nullbr_client,
@@ -1609,6 +1696,7 @@ class P115StrgmSub(_PluginBase):
             save_data_func=self.save_data,
             lifecycle_store=self._lifecycle_store,
             on_pending_created_func=self._on_plugin_pending_created,
+            nextfind_manager=self._nextfind_manager,
         )
 
         self._api_handler = ApiHandler(
@@ -1643,6 +1731,12 @@ class P115StrgmSub(_PluginBase):
             "ayclub_url": self._ayclub_url,
             "ayclub_timeout": self._ayclub_timeout,
             "ayclub_max_pages": self._ayclub_max_pages,
+            # NextFind OpenAPI（值仅保存在 MoviePilot 本地配置）
+            "nextfind_enabled": self._nextfind_enabled,
+            "nextfind_url": self._nextfind_url,
+            "nextfind_api_key": self._nextfind_api_key,
+            "nextfind_timeout": self._nextfind_timeout,
+            "nextfind_wait_hours": self._nextfind_wait_hours,
             "nullbr_enabled": self._nullbr_enabled,
             "nullbr_appid": self._nullbr_appid,
             "nullbr_api_key": self._nullbr_api_key,
@@ -1971,6 +2065,10 @@ class P115StrgmSub(_PluginBase):
 
         self._init_lifecycle_store()
         self._lifecycle_store.reconcile_active(all_subscribes or [])
+        if self._nextfind_manager:
+            self._nextfind_manager.reconcile_active_subscribe_ids(
+                [int(item.id) for item in (all_subscribes or [])]
+            )
 
         completed_wash_subscribes: List[Any] = []
         if not targeted_request and scheduled_evening_refresh:
