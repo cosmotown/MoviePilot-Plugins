@@ -316,6 +316,87 @@ class SyncHandler:
                 result.append(number)
         return sorted(result)
 
+    @staticmethod
+    def _resolve_tv_missing_signal(
+        *,
+        mp_reported_satisfied: bool,
+        parsed_missing_episodes: List[int],
+        reported_lack: int,
+        expected_episodes: Set[int],
+        is_best_version: bool,
+    ) -> tuple[List[int], str]:
+        """Disambiguate MP zero-missing from an unparseable missing detail.
+
+        ``satisfied`` is only returned for an explicit MP satisfied result.
+        ``reported_full_missing`` is a narrow normal-subscription fallback when
+        MP reports at least the whole expected season missing but provides no
+        episode detail. Wash subscriptions never use that fallback.
+        """
+        parsed: Set[int] = set()
+        for value in parsed_missing_episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                parsed.add(episode)
+
+        if mp_reported_satisfied:
+            return [], "satisfied"
+        if parsed:
+            return sorted(parsed), "known_missing"
+
+        try:
+            lack_count = max(0, int(reported_lack or 0))
+        except (TypeError, ValueError):
+            lack_count = 0
+        expected: Set[int] = set()
+        for value in expected_episodes or set():
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                expected.add(episode)
+        if (
+            not is_best_version
+            and expected
+            and lack_count >= len(expected)
+        ):
+            return sorted(expected), "reported_full_missing"
+        return [], "unknown"
+
+    @staticmethod
+    def _tv_missing_strm_conflict(
+        *,
+        expected_episodes: Set[int],
+        mp_missing_episodes: List[int],
+        mp_missing_state: str,
+    ) -> tuple[bool, List[int], str]:
+        """Keep the no-STRM safety stop without treating unknown as zero missing."""
+        if str(mp_missing_state or "") == "unknown":
+            return True, [], "unknown_missing_detail"
+        expected: Set[int] = set()
+        missing: Set[int] = set()
+        for value in expected_episodes or set():
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                expected.add(episode)
+        for value in mp_missing_episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                missing.add(episode)
+        present = sorted(expected - missing)
+        if present:
+            return True, present, "mp_claimed_present"
+        return False, [], "none"
+
 
     @staticmethod
     def _select_tv_delivery_episodes(
@@ -2460,7 +2541,33 @@ class SyncHandler:
                     if episode >= int(subscribe.start_episode)
                 ]
 
-            mp_missing_episodes = list(missing_episodes)
+            try:
+                total_episode = int(subscribe.total_episode or 0)
+            except (TypeError, ValueError):
+                total_episode = 0
+            start_episode = max(1, int(subscribe.start_episode or 1))
+            expected_episodes = (
+                set(range(start_episode, total_episode + 1))
+                if total_episode > 0
+                else set()
+            )
+            try:
+                reported_lack = int(getattr(subscribe, "lack_episode", 0) or 0)
+            except (TypeError, ValueError):
+                reported_lack = 0
+
+            mp_missing_episodes, mp_missing_state = self._resolve_tv_missing_signal(
+                mp_reported_satisfied=mp_reported_satisfied,
+                parsed_missing_episodes=missing_episodes,
+                reported_lack=reported_lack,
+                expected_episodes=expected_episodes,
+                is_best_version=is_best_version,
+            )
+            if mp_missing_state == "reported_full_missing":
+                logger.warning(
+                    f"{mediainfo.title_year} S{season} MP 报告缺失数量={reported_lack}，"
+                    "但详细缺集列表为空；普通追更按全季缺失窄范围兜底"
+                )
             local_missing_episodes = list(mp_missing_episodes)
 
             # 本地 STRM 是本环境的可播放事实源。MoviePilot 的下载历史和
@@ -2469,13 +2576,7 @@ class SyncHandler:
                 mediainfo=mediainfo,
                 season=season,
             )
-            try:
-                total_episode = int(subscribe.total_episode or 0)
-            except (TypeError, ValueError):
-                total_episode = 0
-            start_episode = max(1, int(subscribe.start_episode or 1))
-            if total_episode > 0:
-                expected_episodes = set(range(start_episode, total_episode + 1))
+            if expected_episodes:
                 if strm_status == "ok":
                     local_missing = sorted(expected_episodes - strm_episodes)
                     if set(local_missing) != set(mp_missing_episodes):
@@ -2501,15 +2602,28 @@ class SyncHandler:
                     )
                     return transferred_count
                 else:
-                    # 新订阅在还没有任何已存在集时可以没有 show 目录；若 MP
-                    # 声称已有剧集而 STRM 目录完全找不到，则状态冲突，安全停止。
-                    mp_present = expected_episodes - set(mp_missing_episodes)
-                    if mp_present:
-                        logger.error(
-                            f"{mediainfo.title_year} S{season} MP 声称已有集数 "
-                            f"{sorted(mp_present)}，但未找到对应 STRM 目录；"
-                            "本轮停止该订阅"
+                    # 新订阅可以还没有 show 目录；但只有“明确全季缺失”才能继续。
+                    # MP 明确已满足、明确部分已有，或缺失详情未知时都安全停止。
+                    stop_for_conflict, mp_present, conflict_reason = (
+                        self._tv_missing_strm_conflict(
+                            expected_episodes=expected_episodes,
+                            mp_missing_episodes=mp_missing_episodes,
+                            mp_missing_state=mp_missing_state,
                         )
+                    )
+                    if stop_for_conflict:
+                        if conflict_reason == "unknown_missing_detail":
+                            logger.error(
+                                f"{mediainfo.title_year} S{season} MP 报告订阅未满足，"
+                                f"但详细缺集列表无法解析且缺失数量={reported_lack}；"
+                                "未找到对应 STRM 目录，本轮安全停止"
+                            )
+                        else:
+                            logger.error(
+                                f"{mediainfo.title_year} S{season} MP 声称已有集数 "
+                                f"{mp_present}，但未找到对应 STRM 目录；"
+                                "本轮停止该订阅"
+                            )
                         return transferred_count
 
             missing_episodes = self._select_tv_delivery_episodes(

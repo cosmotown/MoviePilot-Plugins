@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合 MoviePilot 正式缺失状态，自动处理 AYCLUB 115/ED2K，并支持 NextFind 临时兜底。",
     "labels": "订阅,115网盘,STRM",
-    "version": "1.9.13",
+    "version": "1.9.14",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.9.14": "修复电视剧全新订阅缺集详情为空时被误判为全季已存在：显式区分 MP 已满足、已解析缺集、缺失详情未知三种状态；普通追更仅在 lack_episode 覆盖完整期望季时窄范围兜底为全季缺失，保留 MP 声称已有但无 STRM 目录、STRM 根不可访问及状态未知时的安全停止；洗版订阅不使用该兜底。AYCLUB、NextFind、115、ED2K、PT 窗口、生命周期与洗版流程不变。",
       "v1.9.13": "新增 NextFind 临时兜底：仅 AYCLUB 真实搜索已完成且无有效115/ED2K投递时，调用 NextFind 智能体订阅；远端同 TMDB 活跃后暂停 AYCLUB，并复用既有 MoviePilot 缺失核验与 PT 在途屏障；添加前后双重核验、远端失败/消失/超时恢复、插件创建订阅完成后自动移除、手工 NextFind 订阅不删除；地址与 API Key 仅保存在本地插件配置，既有 AYCLUB、ED2K、115、洗版和分类逻辑不改。",
       "v1.9.12": "修复活动洗版订阅被本地 STRM 完整状态提前短路及 PT 窗口重复下载：普通追更继续以本地实际缺集决定投递，洗版订阅改用 MoviePilot 质量目标，不再用 STRM 结果覆盖 MP 缺失/洗版事实；洗版候选仅接受满足全部配置条件的资源，MoviePilot TransferComplete 后按官方订阅接口回填终态质量并完成洗版；PT 已开放后若插件新增 115/ED2K 在途任务，立即重新屏蔽 PT 并重新进入入库屏障。",
       "v1.9.11": "修复 MoviePilot 订阅 status-only 事件造成的无效定向同步：EVH 等外部服务重复 PUT 相同订阅状态时，插件仅记录事件，不更新插件生命周期、不安排即时同步、不调用任何搜索源或 AYCLUB Bridge；普通字段修改、reset、新增/重新订阅、Cron、手动/API 以及 1.9.10 既有查询来源门禁全部保持不变。",
