@@ -335,6 +335,43 @@ class P115StrmHelperLifeEventTailer:
     def manual_subscriptions_snapshot(self) -> List[Dict[str, Any]]:
         return self._manual_subscriptions()
 
+    def _request_reconcile(self, reason: str) -> bool:
+        """Request one bounded OpenClaw handoff pass.
+
+        This is never a polling loop. It is used only for an observed database
+        write, plugin startup, cursor reset, or MoviePilot lifecycle recovery.
+        """
+        if not self._bridge or not hasattr(
+            self._bridge, "reconcile_p115_handoffs"
+        ):
+            logger.warning(
+                "OpenClaw客户端不支持115一次性交接补偿"
+            )
+            return False
+        safe_reason = str(reason or "life_event")[:128]
+        try:
+            ok = bool(
+                self._bridge.reconcile_p115_handoffs(
+                    manual_subscriptions=self._manual_subscriptions(),
+                    reason=safe_reason,
+                )
+            )
+        except Exception as error:
+            logger.warning(
+                f"请求OpenClaw一次性交接补偿失败："
+                f"reason={safe_reason}，错误={type(error).__name__}"
+            )
+            return False
+        if ok:
+            logger.info(
+                f"已请求OpenClaw一次性交接补偿：reason={safe_reason}"
+            )
+        else:
+            logger.warning(
+                f"OpenClaw未接受一次性交接补偿：reason={safe_reason}"
+            )
+        return ok
+
     @staticmethod
     def _payload(row: Dict[str, Any], path: str) -> Dict[str, Any]:
         return {
@@ -369,10 +406,35 @@ class P115StrmHelperLifeEventTailer:
             advanced = cursor
             pending_path = False
             pending_delivery = False
+            reconcile_requested = False
             now = int(time.time())
             placeholders = ",".join(str(value) for value in self.EVENT_TYPES)
 
             with session_factory() as db:
+                if cursor > 0:
+                    max_row = db.execute(
+                        text("SELECT COALESCE(MAX(id),0) FROM life_event")
+                    ).first()
+                    max_event_id = int(max_row[0] if max_row else 0)
+                    if cursor > max_event_id:
+                        logger.warning(
+                            f"115助手生活事件数据库游标回退："
+                            f"saved={cursor}，db_max={max_event_id}；"
+                            "请求一次有界补偿并重置游标"
+                        )
+                        ok = self._request_reconcile(
+                            "life_event_cursor_rebased"
+                        )
+                        self._save_cursor(max_event_id)
+                        return PollBatchResult(
+                            0,
+                            0,
+                            cursor,
+                            max_event_id,
+                            False,
+                            not ok,
+                        )
+
                 if cursor > 0:
                     statement = text(
                         f"SELECT id,type,file_id,parent_id,file_name,file_category,"
@@ -410,12 +472,33 @@ class P115StrmHelperLifeEventTailer:
                     path = self._resolve_path(db, row)
                     if not path:
                         event_time = int(row.get("update_time") or 0)
-                        if event_time <= 0 or now - event_time < self._unresolved_grace_seconds:
+                        if (
+                            event_time <= 0
+                            or now - event_time
+                            < self._unresolved_grace_seconds
+                        ):
                             pending_path = True
                             break
-                        logger.debug(
-                            f"115生活事件路径在有限等待后仍不可解析，跳过：event_id={event_id}"
-                        )
+
+                        # /dbonline、/nextfind 和 ED2K 暂存目录不一定在
+                        # P115StrmHelper 的 files/folders 路径表中。以前这里
+                        # 会直接跳过并推进游标，导致桥接器永远收不到唤醒。
+                        # 现在每个数据库写入批次最多请求一次有界补偿；
+                        # OpenClaw只扫描三个固定暂存目录一次，不启动循环。
+                        if not reconcile_requested:
+                            ok = self._request_reconcile(
+                                "life_event_unresolved_path"
+                            )
+                            if not ok:
+                                pending_delivery = True
+                                break
+                            reconcile_requested = True
+                            logger.info(
+                                "115生活事件路径不可解析，"
+                                "已改用一次性有界交接补偿："
+                                f"event_id={event_id}"
+                            )
+
                         advanced = event_id
                         continue
 
@@ -565,6 +648,7 @@ class P115StrmHelperLifeEventTailer:
         watched_names = {
             db_path.name,
             db_path.name + "-wal",
+            db_path.name + "-shm",
             db_path.name + "-journal",
         }
         inotify_fd: Optional[int] = None
@@ -576,6 +660,14 @@ class P115StrmHelperLifeEventTailer:
                 f"115助手生活事件桥接已阻塞监听数据库写入：{db_path}；空闲时零SELECT"
             )
             self._drain_bounded("startup")
+
+            # 插件启动时做且仅做一次固定目录补偿，覆盖：
+            # 1. 115助手稍晚于本插件初始化；
+            # 2. MoviePilot上次异常退出；
+            # 3. 115助手在MP整理期间暂停而未补拉的生活事件。
+            # 此调用不会建立扫描循环。
+            self._request_reconcile("plugin_startup")
+
             while not self._stop_event.is_set():
                 readable, _, _ = select.select(
                     [inotify_fd, self._stop_pipe_r], [], []
