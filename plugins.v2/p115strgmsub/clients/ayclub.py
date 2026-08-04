@@ -5,6 +5,8 @@ AYCLUB Telegram 影视机器人桥接客户端。
 按 TMDB、年份、标题、季集信息返回 115cdn 分享链接。
 """
 
+import re
+
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -89,17 +91,15 @@ class AyclubClient:
 
     @staticmethod
     def _is_allowed_ed2k_url(source_url: str) -> bool:
-        """只接受完整 ED2K file 链接，后续提交时保留原始字符串。"""
+        """接受单条或多条完整ED2K；标题文本只用于展示，不会被执行。"""
         value = (source_url or "").strip()
-        lowered = value.casefold()
-        return bool(
-            20 <= len(value) <= 16384
-            and "\r" not in value
-            and "\n" not in value
-            and lowered.startswith("ed2k://|file|")
-            and lowered.endswith("|/")
-            and value.count("|") >= 5
-        )
+        if not 20 <= len(value) <= 200_000 or "\x00" in value:
+            return False
+        return bool(re.search(
+            r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}(?:\|h=[A-Za-z0-9]+)?\|/",
+            value,
+            re.I,
+        ))
 
     def health(self) -> bool:
         """检查桥接服务是否正常且 Telegram Session 已授权。"""

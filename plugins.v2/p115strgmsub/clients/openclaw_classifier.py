@@ -5,6 +5,7 @@ OpenClaw 115 七分类服务客户端。
 本客户端不轮询下载，也不移动下载文件。
 """
 import hashlib
+import re
 from typing import Any, Dict, Iterable, Optional
 
 import requests
@@ -51,16 +52,15 @@ class OpenClawClassifierClient:
 
     @staticmethod
     def _is_ed2k_url(source_url: str) -> bool:
+        """Accept one link or a text block containing complete ED2K links."""
         value = (source_url or "").strip()
-        lowered = value.casefold()
-        return bool(
-            20 <= len(value) <= 16384
-            and "\r" not in value
-            and "\n" not in value
-            and lowered.startswith("ed2k://|file|")
-            and lowered.endswith("|/")
-            and value.count("|") >= 5
-        )
+        if not 20 <= len(value) <= 200_000 or "\x00" in value:
+            return False
+        return bool(re.search(
+            r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}(?:\|h=[A-Za-z0-9]+)?\|/",
+            value,
+            re.I,
+        ))
 
     @staticmethod
     def _ed2k_ref(source_url: str) -> str:
@@ -248,6 +248,151 @@ class OpenClawClassifierClient:
             "request_id": expected_request_id,
         }
 
+
+    @property
+    def task_api_ready(self) -> bool:
+        """The task API needs only the existing bridge URL/token, not classifier enablement."""
+        return bool(self.base_url and self.token)
+
+    def register_nextfind_task(
+        self,
+        *,
+        task_id: str,
+        subscribe_id: int,
+        media_type: str,
+        title: str,
+        year: Optional[int],
+        tmdb_id: int,
+        season: Optional[int],
+        missing_episodes: Optional[Iterable[int]],
+        mode: str,
+        ttl_seconds: int = 21600,
+    ) -> bool:
+        """Publish MoviePilot's current missing-episode manifest to the bridge."""
+        if not self.task_api_ready:
+            logger.warning("OpenClaw 地址或令牌未配置，不能登记 NextFind 缺集任务")
+            return False
+        episodes = []
+        for value in missing_episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 < episode <= 999 and episode not in episodes:
+                episodes.append(episode)
+        episodes.sort()
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/openclaw/nextfind/tasks",
+                headers={"X-OpenClaw-Token": self.token, "Content-Type": "application/json"},
+                json={
+                    "task_id": str(task_id),
+                    "subscribe_id": int(subscribe_id or 0),
+                    "media_type": str(media_type).casefold(),
+                    "title": str(title or ""),
+                    "year": int(year) if year else None,
+                    "tmdb_id": int(tmdb_id),
+                    "season": int(season) if season is not None else None,
+                    "missing_episodes": episodes,
+                    "mode": str(mode or "incremental"),
+                    "ttl_seconds": int(ttl_seconds),
+                },
+                timeout=(10, min(self.timeout, 60)),
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+        except Exception as error:
+            logger.error(f"登记 NextFind 缺集任务失败：task={task_id}，错误={type(error).__name__}")
+            return False
+        echoed = data.get("task") if isinstance(data, dict) else None
+        ok = bool(
+            isinstance(echoed, dict)
+            and data.get("ok") is True
+            and str(echoed.get("task_id") or "") == str(task_id)
+            and int(echoed.get("tmdb_id") or 0) == int(tmdb_id)
+            and sorted(int(x) for x in echoed.get("missing_episodes") or []) == episodes
+        )
+        if not ok:
+            logger.warning(f"NextFind 缺集任务响应未通过回显校验：task={task_id}")
+        return ok
+
+    def delete_nextfind_task(self, task_id: str) -> bool:
+        if not self.task_api_ready:
+            return False
+        try:
+            response = self._session.delete(
+                f"{self.base_url}/api/openclaw/nextfind/tasks/{task_id}",
+                headers={"X-OpenClaw-Token": self.token},
+                timeout=(10, min(self.timeout, 60)),
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+            return bool(isinstance(data, dict) and data.get("ok") is True)
+        except Exception as error:
+            logger.warning(f"删除 NextFind 缺集任务失败：task={task_id}，错误={type(error).__name__}")
+            return False
+
+    def forward_p115_life_event(
+        self,
+        event_payload: Dict[str, Any],
+        manual_subscriptions: Optional[Iterable[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Forward one already-observed 115 life event using the existing token."""
+        if not self.task_api_ready:
+            return False
+        payload = dict(event_payload or {})
+        payload["nextfind_manual_subscriptions"] = [
+            dict(item) for item in (manual_subscriptions or [])
+            if isinstance(item, dict)
+        ][:200]
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/openclaw/events/p115",
+                headers={"X-OpenClaw-Token": self.token, "Content-Type": "application/json"},
+                json=payload,
+                timeout=(10, min(self.timeout, 60)),
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+            return bool(isinstance(data, dict) and data.get("ok") is True)
+        except Exception as error:
+            logger.warning(
+                f"转发115生活事件到 OpenClaw 失败："
+                f"event={payload.get('event_id')}，错误={type(error).__name__}"
+            )
+            return False
+
+    def reconcile_p115_handoffs(
+        self,
+        manual_subscriptions: Optional[Iterable[Dict[str, Any]]] = None,
+        reason: str = "manual",
+    ) -> bool:
+        """Request one bounded recovery pass; this never starts a scan loop."""
+        if not self.task_api_ready:
+            return False
+        payload = {
+            "reason": str(reason or "manual")[:128],
+            "nextfind_manual_subscriptions": [
+                dict(item) for item in (manual_subscriptions or [])
+                if isinstance(item, dict)
+            ][:200],
+        }
+        try:
+            response = self._session.post(
+                f"{self.base_url}/api/openclaw/events/p115/reconcile",
+                headers={"X-OpenClaw-Token": self.token, "Content-Type": "application/json"},
+                json=payload,
+                timeout=(10, min(self.timeout, 60)),
+            )
+            response.raise_for_status()
+            data = response.json() if response.content else {}
+            return bool(isinstance(data, dict) and data.get("ok") is True)
+        except Exception as error:
+            logger.warning(
+                f"请求OpenClaw一次性交接补偿失败：reason={reason}，"
+                f"错误={type(error).__name__}"
+            )
+            return False
 
     def inspect_share(
         self,

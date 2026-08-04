@@ -51,6 +51,7 @@ class NextFindHandoffManager:
         self,
         *,
         client: Optional[NextFindClient],
+        bridge_client=None,
         lifecycle_store: LifecycleStore,
         get_data_func: Optional[Callable] = None,
         save_data_func: Optional[Callable] = None,
@@ -58,6 +59,7 @@ class NextFindHandoffManager:
         on_pending_created_func: Optional[Callable] = None,
     ) -> None:
         self._client = client
+        self._bridge = bridge_client
         self._lifecycle = lifecycle_store
         self._get_data = get_data_func
         self._save_data = save_data_func
@@ -96,6 +98,113 @@ class NextFindHandoffManager:
     def _media_key(tmdb_id: int, media_type: str) -> str:
         normalized = "tv" if str(media_type).casefold() == "tv" else "movie"
         return f"{normalized}:{int(tmdb_id)}"
+
+
+    @staticmethod
+    def _bridge_task_id(subscribe: Any, tmdb_id: int, media_type: str, season: Optional[int]) -> str:
+        sid = int(getattr(subscribe, "id"))
+        suffix = f":S{int(season or 1)}" if str(media_type).casefold() == "tv" else ":movie"
+        return f"p115strgmsub:{sid}:{str(media_type).casefold()}:{int(tmdb_id)}{suffix}"
+
+    def _register_bridge_task(
+        self,
+        *,
+        subscribe: Any,
+        tmdb_id: int,
+        media_type: str,
+        title: str,
+        season: Optional[int],
+        episodes: Optional[Iterable[int]],
+    ) -> bool:
+        bridge_ready = bool(
+            self._bridge
+            and getattr(
+                self._bridge,
+                "task_api_ready",
+                getattr(self._bridge, "is_ready", False),
+            )
+        )
+        if not bridge_ready:
+            logger.warning("NextFind 已启用，但 OpenClaw 地址或令牌未就绪；不创建无法预筛选的任务")
+            return False
+        mode = "wash" if bool(getattr(subscribe, "best_version", False)) else "incremental"
+        normalized = []
+        for value in episodes or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0 and episode not in normalized:
+                normalized.append(episode)
+        normalized.sort()
+        if str(media_type).casefold() == "tv" and mode == "incremental" and not normalized:
+            logger.warning("MoviePilot 未提供明确缺集，不登记 NextFind 增量任务")
+            return False
+        return bool(self._bridge.register_nextfind_task(
+            task_id=self._bridge_task_id(subscribe, tmdb_id, media_type, season),
+            subscribe_id=int(getattr(subscribe, "id")),
+            media_type=media_type,
+            title=title,
+            year=getattr(subscribe, "year", None),
+            tmdb_id=int(tmdb_id),
+            season=season,
+            missing_episodes=normalized,
+            mode=mode,
+        ))
+
+    def manual_remote_subscriptions(self) -> List[Dict[str, Any]]:
+        """Return active NextFind subscriptions not created by this plugin."""
+        if not self.is_ready:
+            return []
+        ok, items = self._list_remote(force_refresh=False)
+        if not ok:
+            return []
+        result: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict) or not self._client.is_active_subscription(item):
+                continue
+            tmdb_id = self._client.subscription_tmdb_id(item)
+            media_type = self._client.subscription_media_type(item)
+            if not tmdb_id or media_type not in {"tv", "movie"}:
+                continue
+            local = self._get_record(self._media_key(int(tmdb_id), media_type))
+            if local and bool(local.get("managed_by_plugin")):
+                continue
+            sources = [item]
+            for key in ("media", "subscription", "item", "info", "metadata"):
+                value = item.get(key)
+                if isinstance(value, dict):
+                    sources.append(value)
+            title = ""
+            year = None
+            season = None
+            for source in sources:
+                title = title or str(source.get("title") or source.get("name") or "").strip()
+                if year is None:
+                    try:
+                        year = int(source.get("year")) if source.get("year") else None
+                    except (TypeError, ValueError):
+                        year = None
+                if season is None:
+                    try:
+                        season = int(source.get("season")) if source.get("season") is not None else None
+                    except (TypeError, ValueError):
+                        season = None
+            result.append({
+                "tmdb_id": int(tmdb_id),
+                "media_type": media_type,
+                "title": title or f"TMDB {tmdb_id}",
+                "year": year,
+                "season": season,
+            })
+        return result
+
+    def _delete_bridge_task(self, subscribe_id: int, tmdb_id: int, media_type: str, season: Optional[int]) -> None:
+        if not self._bridge:
+            return
+        stub = type("SubscribeRef", (), {"id": int(subscribe_id)})()
+        task_id = self._bridge_task_id(stub, tmdb_id, media_type, season)
+        self._bridge.delete_nextfind_task(task_id)
 
     def _empty(self) -> Dict[str, Any]:
         return {"schema_version": self.SCHEMA_VERSION, "records": {}}
@@ -230,6 +339,14 @@ class NextFindHandoffManager:
         record: Dict[str, Any],
         reason: str,
     ) -> None:
+        seasons = [int(v) for v in record.get("seasons") or [] if str(v).isdigit()]
+        season = seasons[0] if seasons else None
+        for sid in record.get("subscribe_ids") or []:
+            if str(sid).isdigit():
+                self._delete_bridge_task(
+                    int(sid), int(record.get("tmdb_id")),
+                    str(record.get("media_type") or "movie"), season,
+                )
         if bool(record.get("managed_by_plugin")) and self.is_ready:
             self._client.remove_subscription(
                 tmdb_id=int(record.get("tmdb_id")),
@@ -507,6 +624,16 @@ class NextFindHandoffManager:
             media_type=media_type,
         )
 
+        handoff_exists = bool(remote) or local.get("status") in {
+            "active", "remote_completed", "pending_confirmation", "cleanup_pending"
+        }
+        if handoff_exists and not self._register_bridge_task(
+            subscribe=subscribe, tmdb_id=int(tmdb_id), media_type=media_type,
+            title=title, season=season, episodes=episodes,
+        ):
+            logger.warning(f"NextFind 缺集任务未在桥接器确认，恢复 AYCLUB：{title} (TMDB={tmdb_id})")
+            return False
+
         if remote_ok and remote:
             info = self._remote_info_status(
                 tmdb_id=int(tmdb_id),
@@ -728,6 +855,15 @@ class NextFindHandoffManager:
                     f"{title} (TMDB={tmdb_id})"
                 )
 
+        if not self._register_bridge_task(
+            subscribe=subscribe, tmdb_id=tmdb_id, media_type=media_type,
+            title=title, season=season, episodes=episodes,
+        ):
+            if managed is True:
+                self._client.remove_subscription(tmdb_id=tmdb_id, media_type=media_type)
+            logger.warning(f"桥接器未确认缺集清单，本轮不让 NextFind 接管：{title} (TMDB={tmdb_id})")
+            return False
+
         record = self._upsert_record(
             tmdb_id=tmdb_id,
             media_type=media_type,
@@ -812,6 +948,12 @@ class NextFindHandoffManager:
             record = (state.get("records") or {}).get(key)
             if not record:
                 return
+            seasons = [int(v) for v in record.get("seasons") or [] if str(v).isdigit()]
+            season = seasons[0] if seasons else None
+            self._delete_bridge_task(
+                int(subscribe_id), int(record.get("tmdb_id")),
+                str(record.get("media_type") or "movie"), season,
+            )
             owners = {
                 int(value)
                 for value in record.get("subscribe_ids") or []

@@ -1004,6 +1004,257 @@ class SyncHandler:
         )
         return True, False
 
+
+    @staticmethod
+    def _strict_ed2k_links(source: str) -> List[str]:
+        """Extract complete ED2K file links without silently truncating a batch."""
+        text = str(source or "").replace("\\/", "/")
+        pattern = re.compile(
+            r"ed2k://\|file\|[^|\r\n]+\|\d+\|[A-Fa-f0-9]{32}(?:\|h=[A-Za-z0-9]+)?\|/",
+            re.I,
+        )
+        links: List[str] = []
+        seen: Set[str] = set()
+        for match in pattern.finditer(text):
+            link = match.group(0).strip()
+            if link and link not in seen:
+                seen.add(link)
+                links.append(link)
+        return links if len(links) <= 200 else []
+
+    def _prepare_tv_ed2k_batch_entries(
+        self,
+        *,
+        entries: List[Dict[str, Any]],
+        season: int,
+    ) -> List[Dict[str, Any]]:
+        """Select one non-overlapping real ED2K file per currently needed episode.
+
+        AYCLUB returns every ED2K as a separate match. A displayed range such
+        as S01E14-S01E15 may therefore be attached to both individual links;
+        the real ED2K filename is authoritative and narrows each link back to
+        E14 or E15 before batching.
+        """
+        candidates: List[Dict[str, Any]] = []
+        for order, entry in enumerate(entries or []):
+            resource = entry.get("resource")
+            if not isinstance(resource, dict):
+                continue
+            desired: Set[int] = set()
+            for value in entry.get("episodes") or []:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if 0 < episode <= 999:
+                    desired.add(episode)
+            if not desired:
+                continue
+            for link in self._strict_ed2k_links(str(resource.get("url") or "")):
+                parts = link.split("|")
+                if len(parts) < 6:
+                    continue
+                try:
+                    file_name = unquote(parts[2]).strip()
+                except Exception:
+                    file_name = str(parts[2] or "").strip()
+                seasons, actual = self._episode_identity_from_text(
+                    file_name,
+                    default_season=int(season),
+                )
+                actual = {int(value) for value in actual if int(value) > 0}
+                if not actual or (seasons and int(season) not in seasons):
+                    logger.warning(
+                        f"跳过无法从真实文件名确认当前季集号的ED2K："
+                        f"ref={self._ed2k_source_ref(link)}"
+                    )
+                    continue
+                # One ED2K link is indivisible. Do not download a multi-episode
+                # file that also contains episodes outside the MP target set.
+                if not actual.issubset(desired):
+                    logger.info(
+                        f"跳过包含非目标集的ED2K文件：ref={self._ed2k_source_ref(link)}，"
+                        f"文件集={sorted(actual)}，目标集={sorted(desired)}"
+                    )
+                    continue
+                linked = dict(resource)
+                linked["url"] = link
+                linked["title"] = file_name or str(resource.get("title") or "")
+                candidates.append({
+                    "resource": linked,
+                    "episodes": sorted(actual),
+                    "filter_score": int(entry.get("filter_score") or 0),
+                    "perfect_match": bool(entry.get("perfect_match")),
+                    "order": order,
+                })
+
+        candidates.sort(
+            key=lambda item: (
+                not bool(item.get("perfect_match")),
+                -int(item.get("filter_score") or 0),
+                int(item.get("order") or 0),
+            )
+        )
+        selected: List[Dict[str, Any]] = []
+        claimed: Set[int] = set()
+        seen_refs: Set[str] = set()
+        for item in candidates:
+            resource = item["resource"]
+            ref = self._ed2k_source_ref(str(resource.get("url") or ""))
+            episodes = set(item.get("episodes") or [])
+            if not ref or ref in seen_refs or episodes & claimed:
+                continue
+            seen_refs.add(ref)
+            claimed.update(episodes)
+            selected.append(item)
+        return selected
+
+    def _dispatch_tv_ed2k_resources_batch(
+        self,
+        *,
+        subscribe: Any,
+        media_key: str,
+        entries: List[Dict[str, Any]],
+        mediainfo: MediaInfo,
+        season: int,
+    ) -> Dict[str, Any]:
+        """Submit all selected TV ED2K links in one OpenClaw/115 batch."""
+        selected = self._prepare_tv_ed2k_batch_entries(
+            entries=entries,
+            season=int(season),
+        )
+        result_summary = {
+            "accepted_episodes": [],
+            "newly_queued_episodes": [],
+            "duplicate_episodes": [],
+            "selected_count": len(selected),
+            "new_link_count": 0,
+        }
+        if not selected:
+            return result_summary
+        if (
+            not self._classifier_client
+            or not hasattr(self._classifier_client, "submit_ed2k")
+        ):
+            logger.warning("无法批量提交ED2K：OpenClaw客户端未就绪")
+            return result_summary
+
+        subscribe_id = int(getattr(subscribe, "id"))
+        generation = self._lifecycle.generation(subscribe_id)
+        history = self._load_ed2k_dispatch_history()
+        history_changed = False
+        accepted_episodes: Set[int] = set()
+        duplicate_episodes: Set[int] = set()
+        new_items: List[Dict[str, Any]] = []
+
+        for item in selected:
+            resource = item["resource"]
+            source_url = str(resource.get("url") or "").strip()
+            source_ref = self._ed2k_source_ref(source_url)
+            episodes = sorted({int(v) for v in item.get("episodes") or [] if int(v) > 0})
+            dispatch_key = f"{subscribe_id}:{generation}:{source_ref}"
+            old = history.get(dispatch_key) or {}
+            if old and self._lifecycle.has_live_pending_reference(
+                media_key=media_key,
+                share_ref=f"ed2k:{source_ref}",
+                episodes=episodes,
+            ):
+                accepted_episodes.update(episodes)
+                duplicate_episodes.update(episodes)
+                continue
+            if old:
+                history.pop(dispatch_key, None)
+                history_changed = True
+            new_items.append({
+                **item,
+                "source_url": source_url,
+                "source_ref": source_ref,
+                "dispatch_key": dispatch_key,
+                "episodes": episodes,
+            })
+
+        if not new_items:
+            if history_changed:
+                self._save_ed2k_dispatch_history(history)
+            result_summary.update({
+                "accepted_episodes": sorted(accepted_episodes),
+                "duplicate_episodes": sorted(duplicate_episodes),
+            })
+            return result_summary
+
+        source_urls = [item["source_url"] for item in new_items]
+        requested_episodes = sorted({
+            episode for item in new_items for episode in item["episodes"]
+        })
+        batch_ref = hashlib.sha256("\n".join(source_urls).encode("utf-8")).hexdigest()[:16]
+        batch_request_id = f"{subscribe_id}:{generation}:batch:{batch_ref}"
+        resource_title = (
+            f"{mediainfo.title} S{int(season):02d} ED2K batch "
+            f"E{requested_episodes[0]:02d}-E{requested_episodes[-1]:02d}"
+        )
+        backend = self._classifier_client.submit_ed2k(
+            source_url="\n".join(source_urls),
+            media_type="tv",
+            title=mediainfo.title,
+            year=mediainfo.year,
+            tmdb_id=mediainfo.tmdb_id,
+            season=int(season),
+            episodes=requested_episodes,
+            resource_title=resource_title,
+            request_id=batch_request_id,
+        )
+        if not backend:
+            if history_changed:
+                self._save_ed2k_dispatch_history(history)
+            return result_summary
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        newly_queued: Set[int] = set()
+        for item in new_items:
+            episodes = list(item["episodes"])
+            source_ref = item["source_ref"]
+            attempt_id = f"{int(now.timestamp())}-{source_ref[:8]}"
+            resource = item["resource"]
+            history[item["dispatch_key"]] = {
+                "subscribe_id": subscribe_id,
+                "generation": generation,
+                "media_key": media_key,
+                "source_ref": source_ref,
+                "resource_title": str(resource.get("title") or "")[:500],
+                "episodes": episodes,
+                "attempt_id": attempt_id,
+                "submitted_at": now.isoformat(),
+                "status": str(backend.get("status") or "queued"),
+                "contract_version": int(backend.get("contract_version") or 0),
+                "backend_job_id": str(backend.get("job_id") or ""),
+                "request_id": batch_request_id,
+                "batch_ref": batch_ref,
+            }
+            self._register_ed2k_pending(
+                subscribe=subscribe,
+                media_key=media_key,
+                source_ref=source_ref,
+                resource_title=str(resource.get("title") or "")[:500],
+                episodes=episodes,
+                attempt_id=attempt_id,
+                filter_score=int(item.get("filter_score") or 0),
+                perfect_match=bool(item.get("perfect_match")),
+            )
+            accepted_episodes.update(episodes)
+            newly_queued.update(episodes)
+        self._save_ed2k_dispatch_history(history)
+        logger.info(
+            f"ED2K批量已由一次OpenClaw请求提交：链接={len(new_items)}，"
+            f"集数={sorted(newly_queued)}，batch={batch_ref}"
+        )
+        result_summary.update({
+            "accepted_episodes": sorted(accepted_episodes),
+            "newly_queued_episodes": sorted(newly_queued),
+            "duplicate_episodes": sorted(duplicate_episodes),
+            "new_link_count": len(new_items),
+        })
+        return result_summary
+
     def _prefilter_ayclub_results(
         self,
         resources: List[Dict[str, Any]],
@@ -2349,51 +2600,49 @@ class SyncHandler:
 
         media_key = self._lifecycle.media_key_from_subscribe(subscribe)
         accepted = set(accepted_before)
-        newly_queued: List[int] = []
-        failed: List[int] = []
-        for episode in to_submit:
+        wash_entries = [
+            {
+                "resource": pack.episode_resources[episode],
+                "episodes": [episode],
+                "filter_score": pack.score,
+                "perfect_match": True,
+            }
+            for episode in to_submit
+        ]
+        batch_result = self._dispatch_tv_ed2k_resources_batch(
+            subscribe=subscribe,
+            media_key=media_key,
+            entries=wash_entries,
+            mediainfo=mediainfo,
+            season=season,
+        )
+        accepted.update(batch_result.get("accepted_episodes") or [])
+        newly_queued = list(batch_result.get("newly_queued_episodes") or [])
+        failed = sorted(set(to_submit) - set(accepted))
+        for episode in newly_queued:
             resource = pack.episode_resources[episode]
-            ok, duplicate = self._dispatch_ed2k_resource(
-                subscribe=subscribe,
-                media_key=media_key,
-                resource=resource,
-                mediainfo=mediainfo,
-                media_type="tv",
-                season=season,
-                episodes=[episode],
-            )
-            if ok:
-                accepted.add(episode)
-                if not duplicate:
-                    newly_queued.append(episode)
-                    history.append({
-                        "title": mediainfo.title,
-                        "year": mediainfo.year,
-                        "type": "电视剧",
-                        "status": "成功",
-                        "episode": episode,
-                        "share_ref": (
-                            "ed2k:"
-                            + self._ed2k_source_ref(
-                                str(resource.get("url") or "")
-                            )
-                        ),
-                        "file_name": str(resource.get("title") or "")[:500],
-                        "filter_score": pack.score,
-                        "perfect_match": True,
-                        "subscribe_id": subscribe_id,
-                        "generation": self._lifecycle.generation(subscribe_id),
-                        "media_key": media_key,
-                        "stage": "pending_transfer",
-                        "search_source": (
-                            "ayclub_ed2k_completed_season_wash"
-                        ),
-                        "time": datetime.datetime.now().strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        ),
-                    })
-            else:
-                failed.append(episode)
+            history.append({
+                "title": mediainfo.title,
+                "year": mediainfo.year,
+                "type": "电视剧",
+                "status": "成功",
+                "episode": episode,
+                "share_ref": (
+                    "ed2k:"
+                    + self._ed2k_source_ref(
+                        str(resource.get("url") or "")
+                    )
+                ),
+                "file_name": str(resource.get("title") or "")[:500],
+                "filter_score": pack.score,
+                "perfect_match": True,
+                "subscribe_id": subscribe_id,
+                "generation": self._lifecycle.generation(subscribe_id),
+                "media_key": media_key,
+                "stage": "pending_transfer",
+                "search_source": "ayclub_ed2k_completed_season_wash",
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
 
         complete = set(expected).issubset(accepted)
         status = "submitted" if complete else "partial"
@@ -3072,6 +3321,7 @@ class SyncHandler:
                         if not self._is_ed2k_resource(resource)
                     ]
 
+                    ed2k_batch_entries: List[Dict[str, Any]] = []
                     for resource in ayclub_ed2k_results:
                         ed2k_title = str(resource.get("title") or "")
                         if subscribe_filter.has_filters():
@@ -3103,27 +3353,33 @@ class SyncHandler:
                                 f"原因={reject_reason}；必须明确匹配当前季缺集"
                             )
                             continue
+                        ed2k_batch_entries.append({
+                            "resource": resource,
+                            "episodes": candidate_episodes,
+                            "filter_score": ed2k_score,
+                            "perfect_match": ed2k_perfect,
+                        })
 
-                        accepted, _ = self._dispatch_ed2k_resource(
+                    if ed2k_batch_entries:
+                        batch_result = self._dispatch_tv_ed2k_resources_batch(
                             subscribe=subscribe,
                             media_key=media_key,
-                            resource=resource,
+                            entries=ed2k_batch_entries,
                             mediainfo=mediainfo,
-                            media_type="tv",
                             season=int(season),
-                            episodes=candidate_episodes,
-                            filter_score=ed2k_score,
-                            perfect_match=ed2k_perfect,
                         )
-                        if accepted:
-                            ed2k_dispatched_this_source.update(candidate_episodes)
-                            ed2k_dispatched_episodes.update(candidate_episodes)
+                        ed2k_dispatched_this_source.update(
+                            batch_result.get("accepted_episodes") or []
+                        )
+                        ed2k_dispatched_episodes.update(
+                            batch_result.get("accepted_episodes") or []
+                        )
 
                     if ed2k_dispatched_this_source:
                         logger.info(
-                            f"AYCLUB ED2K 已独立提交，覆盖集数："
+                            f"AYCLUB ED2K 已按缺集合批提交，覆盖集数："
                             f"{sorted(ed2k_dispatched_this_source)}；"
-                            "同消息中的 115 仍按原流程继续验证"
+                            "同消息中的115仍按原流程继续验证"
                         )
 
                 if not p115_results:

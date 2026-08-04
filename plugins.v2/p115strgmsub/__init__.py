@@ -45,6 +45,7 @@ from .handlers import (
     LifecycleStore,
     NextFindHandoffManager,
 )
+from .handlers.life_event_tailer import P115StrmHelperLifeEventTailer
 from .ui import UIConfig
 from .utils import download_so_file
 
@@ -61,7 +62,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.14"
+    plugin_version = "1.9.16"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -169,6 +170,7 @@ class P115StrgmSub(_PluginBase):
     _api_handler: Optional[ApiHandler] = None
     _lifecycle_store: Optional[LifecycleStore] = None
     _nextfind_manager: Optional[NextFindHandoffManager] = None
+    _life_event_tailer: Optional[P115StrmHelperLifeEventTailer] = None
 
     _MIN_INTERVAL_HOURS: int = 8
     _PT_GATE_RECHECK_SECONDS: int = 300
@@ -814,6 +816,73 @@ class P115StrgmSub(_PluginBase):
             )
             return False
 
+    def _run_p115_handoff_reconcile(self, reason: str = "manual"):
+        if not self._classifier_client:
+            return
+        manual = []
+        try:
+            if self._life_event_tailer:
+                manual = self._life_event_tailer.manual_subscriptions_snapshot()
+            elif self._nextfind_manager:
+                manual = self._nextfind_manager.manual_remote_subscriptions()
+        except Exception as error:
+            logger.warning(f"读取NextFind手工订阅用于补偿失败：{type(error).__name__}")
+        ok = self._classifier_client.reconcile_p115_handoffs(
+            manual_subscriptions=manual,
+            reason=reason,
+        )
+        if not ok:
+            logger.warning(f"OpenClaw一次性交接补偿未确认：reason={reason}")
+
+    def _schedule_p115_handoff_reconcile(self, reason: str, delay_seconds: int = 60):
+        bridge_ready = bool(
+            self._classifier_client
+            and getattr(
+                self._classifier_client,
+                "task_api_ready",
+                getattr(self._classifier_client, "is_ready", False),
+            )
+        )
+        if not bridge_ready:
+            return
+        self._ensure_toggle_scheduler()
+        self._toggle_scheduler.add_job(
+            func=self._run_p115_handoff_reconcile,
+            trigger="date",
+            run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=max(1, int(delay_seconds))),
+            args=[str(reason or "unknown")],
+            id="p115_helper_handoff_reconcile_once",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    def _start_p115strmhelper_life_event_tailer(self):
+        bridge_ready = bool(
+            self._classifier_client
+            and getattr(
+                self._classifier_client,
+                "task_api_ready",
+                getattr(self._classifier_client, "is_ready", False),
+            )
+        )
+        if not bridge_ready:
+            logger.info("OpenClaw地址或令牌未就绪，不启动115助手生活事件桥接")
+            self._life_event_tailer = None
+            return
+        self._life_event_tailer = P115StrmHelperLifeEventTailer(
+            bridge_client=self._classifier_client,
+            nextfind_manager=self._nextfind_manager,
+            get_data=self.get_data,
+            save_data=self.save_data,
+        )
+        started = self._life_event_tailer.start()
+        if started:
+            logger.info(
+                "已启动115助手数据库inotify桥接：空闲时零SELECT、零目录扫描、零115请求"
+            )
+        self._schedule_p115_handoff_reconcile("plugin_startup", delay_seconds=30)
+
     # ------------------ MoviePilot 生命周期联动 ------------------
 
     def _init_lifecycle_store(self):
@@ -1166,6 +1235,10 @@ class P115StrgmSub(_PluginBase):
         data = event.event_data or {}
         if not isinstance(data, dict):
             return
+        self._schedule_p115_handoff_reconcile(
+            "mp_transfer_complete" if success else "mp_transfer_failed",
+            delay_seconds=60,
+        )
         mediainfo = data.get("mediainfo")
         meta = data.get("meta")
         if not mediainfo:
@@ -1450,6 +1523,8 @@ class P115StrgmSub(_PluginBase):
             self.__update_config()
             logger.info("用户已关闭屏蔽系统订阅（配置应用）")
 
+        self._start_p115strmhelper_life_event_tailer()
+
         # 立即运行一次
         if self._enabled or self._onlyonce:
             if self._onlyonce:
@@ -1649,6 +1724,7 @@ class P115StrgmSub(_PluginBase):
 
         self._nextfind_manager = NextFindHandoffManager(
             client=self._nextfind_client,
+                bridge_client=self._classifier_client,
             lifecycle_store=self._lifecycle_store,
             get_data_func=self.get_data,
             save_data_func=self.save_data,
@@ -1782,6 +1858,17 @@ class P115StrgmSub(_PluginBase):
     # ------------------ stop ------------------
 
     def stop_service(self):
+        if self._life_event_tailer:
+            try:
+                self._life_event_tailer.stop()
+            except Exception:
+                pass
+        self._life_event_tailer = None
+        if self._toggle_scheduler:
+            try:
+                self._toggle_scheduler.remove_job("p115_helper_handoff_reconcile_once")
+            except Exception:
+                pass
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
