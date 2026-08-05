@@ -152,11 +152,49 @@ class NextFindHandoffManager:
             mode=mode,
         ))
 
-    def manual_remote_subscriptions(self) -> List[Dict[str, Any]]:
-        """Return active NextFind subscriptions not created by this plugin."""
+    @staticmethod
+    def _manual_subscription_generation(item: Dict[str, Any]) -> tuple[str, str]:
+        """Return a stable remote subscription identity and generation.
+
+        A remote ID is preferred because deleting and recreating a manual NF
+        subscription normally creates a new ID. Creation time is included when
+        available. ``updated_at`` is deliberately excluded because progress or
+        status updates must not grant another wash.
+        """
+        sources = [item]
+        for key in ("media", "subscription", "item", "info", "metadata"):
+            value = item.get(key)
+            if isinstance(value, dict):
+                sources.append(value)
+
+        remote_id = ""
+        created_at = ""
+        for source in sources:
+            if not remote_id:
+                for key in ("subscription_id", "subscribe_id", "id", "uuid", "task_id"):
+                    value = str(source.get(key) or "").strip()
+                    if value:
+                        remote_id = value
+                        break
+            if not created_at:
+                for key in ("created_at", "create_time", "created", "ctime", "add_time"):
+                    value = str(source.get(key) or "").strip()
+                    if value:
+                        created_at = value
+                        break
+        if remote_id:
+            return remote_id, f"id:{remote_id}|created:{created_at or '-'}"
+        if created_at:
+            return "", f"created:{created_at}"
+        return "", ""
+
+    def manual_remote_subscriptions(
+        self, *, force_refresh: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Return active manual NextFind subscriptions with stable generations."""
         if not self.is_ready:
             return []
-        ok, items = self._list_remote(force_refresh=False)
+        ok, items = self._list_remote(force_refresh=force_refresh)
         if not ok:
             return []
         result: List[Dict[str, Any]] = []
@@ -190,12 +228,15 @@ class NextFindHandoffManager:
                         season = int(source.get("season")) if source.get("season") is not None else None
                     except (TypeError, ValueError):
                         season = None
+            remote_id, generation = self._manual_subscription_generation(item)
             result.append({
                 "tmdb_id": int(tmdb_id),
                 "media_type": media_type,
                 "title": title or f"TMDB {tmdb_id}",
                 "year": year,
                 "season": season,
+                "subscription_id": remote_id,
+                "generation": generation,
             })
         return result
 

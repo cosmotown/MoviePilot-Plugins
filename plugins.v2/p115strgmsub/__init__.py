@@ -4,6 +4,7 @@
 """
 import datetime
 import hashlib
+import hmac
 import math
 from pathlib import Path
 from threading import Lock
@@ -14,6 +15,7 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import text
+from fastapi import Header
 
 from app.core.config import settings, global_vars
 from app.core.event import Event, eventmanager
@@ -45,7 +47,6 @@ from .handlers import (
     LifecycleStore,
     NextFindHandoffManager,
 )
-from .handlers.life_event_tailer import P115StrmHelperLifeEventTailer
 from .ui import UIConfig
 from .utils import download_so_file
 
@@ -62,7 +63,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.17"
+    plugin_version = "1.9.18"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -170,7 +171,6 @@ class P115StrgmSub(_PluginBase):
     _api_handler: Optional[ApiHandler] = None
     _lifecycle_store: Optional[LifecycleStore] = None
     _nextfind_manager: Optional[NextFindHandoffManager] = None
-    _life_event_tailer: Optional[P115StrmHelperLifeEventTailer] = None
 
     _MIN_INTERVAL_HOURS: int = 8
     _PT_GATE_RECHECK_SECONDS: int = 300
@@ -816,72 +816,6 @@ class P115StrgmSub(_PluginBase):
             )
             return False
 
-    def _run_p115_handoff_reconcile(self, reason: str = "manual"):
-        if not self._classifier_client:
-            return
-        manual = []
-        try:
-            if self._life_event_tailer:
-                manual = self._life_event_tailer.manual_subscriptions_snapshot()
-            elif self._nextfind_manager:
-                manual = self._nextfind_manager.manual_remote_subscriptions()
-        except Exception as error:
-            logger.warning(f"读取NextFind手工订阅用于补偿失败：{type(error).__name__}")
-        ok = self._classifier_client.reconcile_p115_handoffs(
-            manual_subscriptions=manual,
-            reason=reason,
-        )
-        if not ok:
-            logger.warning(f"OpenClaw一次性交接补偿未确认：reason={reason}")
-
-    def _schedule_p115_handoff_reconcile(self, reason: str, delay_seconds: int = 60):
-        bridge_ready = bool(
-            self._classifier_client
-            and getattr(
-                self._classifier_client,
-                "task_api_ready",
-                getattr(self._classifier_client, "is_ready", False),
-            )
-        )
-        if not bridge_ready:
-            return
-        self._ensure_toggle_scheduler()
-        self._toggle_scheduler.add_job(
-            func=self._run_p115_handoff_reconcile,
-            trigger="date",
-            run_date=datetime.datetime.now(tz=pytz.timezone(settings.TZ)) + datetime.timedelta(seconds=max(1, int(delay_seconds))),
-            args=[str(reason or "unknown")],
-            id="p115_helper_handoff_reconcile_once",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
-
-    def _start_p115strmhelper_life_event_tailer(self):
-        bridge_ready = bool(
-            self._classifier_client
-            and getattr(
-                self._classifier_client,
-                "task_api_ready",
-                getattr(self._classifier_client, "is_ready", False),
-            )
-        )
-        if not bridge_ready:
-            logger.info("OpenClaw地址或令牌未就绪，不启动115助手生活事件桥接")
-            self._life_event_tailer = None
-            return
-        self._life_event_tailer = P115StrmHelperLifeEventTailer(
-            bridge_client=self._classifier_client,
-            nextfind_manager=self._nextfind_manager,
-            get_data=self.get_data,
-            save_data=self.save_data,
-        )
-        started = self._life_event_tailer.start()
-        if started:
-            logger.info(
-                "已启动115助手数据库inotify桥接：空闲时零SELECT、零目录扫描、零115请求"
-            )
-        self._schedule_p115_handoff_reconcile("plugin_startup", delay_seconds=30)
 
     # ------------------ MoviePilot 生命周期联动 ------------------
 
@@ -1235,10 +1169,6 @@ class P115StrgmSub(_PluginBase):
         data = event.event_data or {}
         if not isinstance(data, dict):
             return
-        self._schedule_p115_handoff_reconcile(
-            "mp_transfer_complete" if success else "mp_transfer_failed",
-            delay_seconds=60,
-        )
         mediainfo = data.get("mediainfo")
         meta = data.get("meta")
         if not mediainfo:
@@ -1522,8 +1452,6 @@ class P115StrgmSub(_PluginBase):
                     self._try_set_default_sites_for_unblocked(site_ids)
             self.__update_config()
             logger.info("用户已关闭屏蔽系统订阅（配置应用）")
-
-        self._start_p115strmhelper_life_event_tailer()
 
         # 立即运行一次
         if self._enabled or self._onlyonce:
@@ -1858,17 +1786,6 @@ class P115StrgmSub(_PluginBase):
     # ------------------ stop ------------------
 
     def stop_service(self):
-        if self._life_event_tailer:
-            try:
-                self._life_event_tailer.stop()
-            except Exception:
-                pass
-        self._life_event_tailer = None
-        if self._toggle_scheduler:
-            try:
-                self._toggle_scheduler.remove_job("p115_helper_handoff_reconcile_once")
-            except Exception:
-                pass
         try:
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
@@ -1914,6 +1831,12 @@ class P115StrgmSub(_PluginBase):
                 "endpoint": self.api_clear_history,
                 "methods": ["POST"],
                 "summary": "清空历史记录"
+            },
+            {
+                "path": "/nextfind_candidate_context",
+                "endpoint": self.api_nextfind_candidate_context,
+                "methods": ["POST"],
+                "summary": "事件范围内核对NextFind手工候选"
             }
         ]
     
@@ -2332,6 +2255,140 @@ class P115StrgmSub(_PluginBase):
                 )
 
         return True
+
+    # ------------------ Event-scoped NextFind manual context ------------------
+
+    @staticmethod
+    def _parse_candidate_episodes(value: str) -> List[int]:
+        result: Set[int] = set()
+        for token in str(value or "").replace(";", ",").split(","):
+            try:
+                episode = int(token.strip())
+            except (TypeError, ValueError):
+                continue
+            if 0 < episode <= 999:
+                result.add(episode)
+        return sorted(result)
+
+    def api_nextfind_candidate_context(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: Optional[int] = None,
+        candidate_episodes: str = "",
+        x_openclaw_token: Optional[str] = Header(
+            default=None, alias="X-OpenClaw-Token"
+        ),
+    ) -> Dict[str, Any]:
+        """Return manual-NF and local-STRM facts for one life-event candidate.
+
+        This endpoint is never called by a scheduler or plugin startup. The
+        OpenClaw bridge calls it only after a relevant /nextfind life event has
+        identified one stable candidate. It performs no 115 directory read.
+        """
+        expected_token = str(self._classifier_token or "").strip()
+        supplied_token = str(x_openclaw_token or "")
+        if (
+            not expected_token
+            or not supplied_token
+            or not hmac.compare_digest(supplied_token, expected_token)
+        ):
+            return {"ok": False, "reason": "共享令牌认证失败"}
+
+        try:
+            wanted_tmdb = int(tmdb_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "TMDB ID无效"}
+        wanted_type = str(media_type or "").strip().casefold()
+        if wanted_tmdb <= 0 or wanted_type not in {"tv", "movie"}:
+            return {"ok": False, "reason": "媒体身份无效"}
+        wanted_season = None
+        if wanted_type == "tv":
+            try:
+                wanted_season = int(season or 0)
+            except (TypeError, ValueError):
+                wanted_season = 0
+            if wanted_season <= 0:
+                return {"ok": False, "reason": "电视剧候选缺少明确季号"}
+
+        if not self._nextfind_manager:
+            return {"ok": False, "reason": "NextFind管理器未初始化"}
+        subscriptions = self._nextfind_manager.manual_remote_subscriptions(
+            force_refresh=True
+        )
+        matches: List[Dict[str, Any]] = []
+        for item in subscriptions:
+            try:
+                item_tmdb = int(item.get("tmdb_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if item_tmdb != wanted_tmdb:
+                continue
+            if str(item.get("media_type") or "").casefold() != wanted_type:
+                continue
+            item_season = item.get("season")
+            if wanted_type == "tv" and item_season is not None:
+                try:
+                    if int(item_season) != wanted_season:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            matches.append(item)
+
+        if not matches:
+            return {"ok": False, "reason": "未匹配活动的NextFind手工订阅"}
+        generations = {
+            str(item.get("generation") or "").strip() for item in matches
+        }
+        generations.discard("")
+        if len(matches) != 1 or len(generations) != 1:
+            return {
+                "ok": False,
+                "reason": "手工NF订阅匹配不唯一或缺少稳定代次标识",
+            }
+
+        matched = matches[0]
+        generation = next(iter(generations))
+        title = str(matched.get("title") or f"TMDB {wanted_tmdb}")
+        year = matched.get("year")
+        present: List[int] = []
+        strm_status = "not_applicable"
+        strm_dirs: List[str] = []
+        if wanted_type == "tv":
+            if not self._sync_handler:
+                return {"ok": False, "reason": "订阅同步处理器未初始化"}
+            mediainfo = SimpleNamespace(
+                title=title,
+                tmdb_id=wanted_tmdb,
+            )
+            status, episodes, dirs = self._sync_handler._scan_local_strm_episodes(
+                mediainfo=mediainfo,
+                season=wanted_season,
+            )
+            strm_status = str(status or "unknown")
+            present = sorted(int(value) for value in episodes if int(value) > 0)
+            strm_dirs = [str(value) for value in (dirs or [])[:3]]
+
+        logger.info(
+            "NextFind手工候选事件核对："
+            f"TMDB={wanted_tmdb} type={wanted_type} season={wanted_season}，"
+            f"candidate={self._parse_candidate_episodes(candidate_episodes)}，"
+            f"STRM={present} status={strm_status}"
+        )
+        return {
+            "ok": True,
+            "source": "nextfind_manual_event_context",
+            "tmdb_id": wanted_tmdb,
+            "media_type": wanted_type,
+            "season": wanted_season,
+            "title": title,
+            "year": year,
+            "subscription_id": matched.get("subscription_id"),
+            "generation": generation,
+            "present_episodes": present,
+            "strm_status": strm_status,
+            "strm_dirs": strm_dirs,
+        }
 
     # ------------------ API包装（用于 get_api） ------------------
 
