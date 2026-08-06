@@ -63,7 +63,7 @@ class P115StrgmSub(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "1.9.18"
+    plugin_version = "1.9.19"
     # 插件作者
     plugin_author = "mrtian2016"
     # 作者主页
@@ -2304,12 +2304,14 @@ class P115StrgmSub(_PluginBase):
             return {"ok": False, "reason": "媒体身份无效"}
         wanted_season = None
         if wanted_type == "tv":
-            try:
-                wanted_season = int(season or 0)
-            except (TypeError, ValueError):
-                wanted_season = 0
-            if wanted_season <= 0:
+            if season is None:
                 return {"ok": False, "reason": "电视剧候选缺少明确季号"}
+            try:
+                wanted_season = int(season)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "电视剧候选季号无效"}
+            if wanted_season < 0:
+                return {"ok": False, "reason": "电视剧候选季号无效"}
 
         if not self._nextfind_manager:
             return {"ok": False, "reason": "NextFind管理器未初始化"}

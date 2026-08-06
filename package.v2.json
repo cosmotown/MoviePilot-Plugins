@@ -4,11 +4,12 @@
     "release": false,
     "description": "结合 MoviePilot 正式缺失状态，自动处理 AYCLUB 115/ED2K，并支持 NextFind 临时兜底。",
     "labels": "订阅,115网盘,STRM",
-    "version": "1.9.18",
+    "version": "1.9.19",
     "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "mrtian2016",
     "level": 1,
     "history": {
+      "v1.9.19": "修复NextFind手工候选上下文接口将season=0误判为缺少季号：Season 0/S00作为合法特别篇季参与活动手工订阅匹配；未提供季号及负数季号继续拒绝，保留多季整剧移动前的逐季订阅保护。",
       "v1.9.18": "由p115-openclaw独立消费115生活事件，仅在/nextfind、/OpenClaw_ED2K下载中、/dbonline相关事件发生时核对对应候选；移除P115StrmHelper SQLite事件桥接、启动补偿和MP整理后补偿。新增事件范围内的NextFind手工订阅上下文接口：MP任务继续按missing_episodes/wash优先，手工NF按实时STRM区分空库整季、部分追更、完整季一次性洗版和同代次防重复。",
       "v1.9.17": "修复115生活事件已写入但暂存目录不在助手路径表时自动交接不触发：路径有限等待后仍无法解析时，每批仅请求一次OpenClaw有界补偿；插件启动、SQLite游标回退以及MoviePilot整理完成或失败均保留一次性补偿。补充SQLite -shm写入监听，空闲时仍零SELECT、零目录扫描、零115请求，不恢复任何周期扫描。",
       "v1.9.16": "删除每5秒SQLite轮询，改为Linux inotify阻塞等待115助手数据库真实写入；空闲时零SELECT、零目录扫描、零115请求，只在启动、数据库写入和MP整理结束时执行有上限的增量处理。NextFind手工订阅可直接交接；MP整理暂停期间优先复用115助手last游标，另保留一次性定向补偿。电视剧AYCLUB多条ED2K按真实文件名和当前缺集筛选、去重后，一次提交OpenClaw和115批量离线下载。",
